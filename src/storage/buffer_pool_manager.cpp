@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace webdb {
 
@@ -297,7 +298,13 @@ StorageResult BufferPoolManager::release_operation_pins(operation_id_t operation
         return StorageResult::SUCCESS;
     }
 
-    const std::vector<pin_token_t> tokens = operation_it->second;
+    // Moving the token vector is noexcept. Copying it here could allocate and
+    // throw std::bad_alloc during cancellation, which would violate this
+    // function's noexcept cleanup contract and terminate the process. Remove
+    // the reverse index before releasing tokens so release_pin_token() performs
+    // only non-allocating frame/token cleanup for this operation.
+    std::vector<pin_token_t> tokens = std::move(operation_it->second);
+    operation_pins_.erase(operation_it);
 
     for (const pin_token_t token : tokens) release_pin_token(token, operation_id);
     return StorageResult::SUCCESS;

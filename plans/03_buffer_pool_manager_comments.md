@@ -636,3 +636,20 @@ The corrected flow is:
 6. Roll back the `LOADING` frame and waiter registration if allocation fails while registering the first waiter.
 
 Tests now verify that the first miss reserves a frame, preserves the output handle, a second operation joins the load, and the completed load can release its frame back to the free list.
+
+### Follow-up Review: Allocation During `noexcept` Pin Cleanup
+
+**Feedback: Valid. Fixed.** `release_operation_pins()` is declared `noexcept`, but copying the operation's token vector can allocate:
+
+```cpp
+const std::vector<pin_token_t> tokens = operation_it->second;
+```
+
+If that allocation throws `std::bad_alloc`, the `noexcept` function terminates the process instead of completing cancellation cleanup. The implementation now moves the vector:
+
+```cpp
+std::vector<pin_token_t> tokens = std::move(operation_it->second);
+operation_pins_.erase(operation_it);
+```
+
+Moving transfers the vector's existing allocation instead of duplicating all token entries, so it is constant-time and non-allocating for the normal `std::vector` move path. The reverse operation index is erased before token release, allowing `release_pin_token()` to perform frame dirtying, handle invalidation, and token removal without rebuilding or modifying that operation's token vector. This preserves the `noexcept` cleanup guarantee while keeping write mutations and pin ownership state intact.
