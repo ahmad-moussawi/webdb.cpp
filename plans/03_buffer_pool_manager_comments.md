@@ -621,3 +621,18 @@ The following test cases must be added to `tests/test_buffer_pool_manager.cpp` t
 **Feedback: Valid. Fixed.** External `unpin_page()` and `release_operation_pins()` can remove a token without the original RAII object being destroyed. The manager now records the owning `PageHandle*` in each `PinRecord` and invalidates that handle whenever the token is released externally. Invalidated handles report `owns_pin() == false`, and both `data()` and `mutable_data()` return `nullptr`, preventing access through the handle after cancellation or unpinning. Move construction and move assignment update the registered handle pointer so invalidation targets the current owner.
 
 As with any C++ raw pointer API, a caller must not retain a pointer previously returned by `data()` or `mutable_data()` after the handle is released. The handle invalidation prevents access through the handle object; it cannot revoke a raw pointer that the caller copied elsewhere.
+
+### Follow-up Review: Cache Miss Must Reserve a Loading Frame
+
+**Feedback: Valid. Fixed.** The original `pin_page()` miss branch returned `PAGE_NOT_RESIDENT` immediately without assigning a frame or recording the requesting operation. That contradicted the documented contract that a miss starts a load. Every retry could therefore return the same miss while no frame was owned by the buffer pool for the host to complete.
+
+The corrected flow is:
+
+1. Validate the page and operation IDs.
+2. Reserve an `ABSENT` frame and transition it to `LOADING`.
+3. Register the requesting operation in the page's load-waiter list.
+4. Leave the caller's `PageHandle` unchanged and return `PAGE_NOT_RESIDENT` so the scheduler issues the host read.
+5. If another operation requests the same page, register it in the existing waiter list and return `LOAD_IN_PROGRESS`; no duplicate frame or host load is created.
+6. Roll back the `LOADING` frame and waiter registration if allocation fails while registering the first waiter.
+
+Tests now verify that the first miss reserves a frame, preserves the output handle, a second operation joins the load, and the completed load can release its frame back to the free list.

@@ -84,6 +84,20 @@ void test_buffer_pool_manager() {
                     descriptor_after_duplicate->pin_count == descriptor_before_duplicate->pin_count,
                 "Failed duplicate assignment preserves mapping, descriptor, and free-list state");
 
+    PageHandle missing_handle;
+    const size_t free_frames_before_miss = pool.free_frame_count();
+    TEST_ASSERT(pool.pin_page(FIRST_DATA_PAGE_ID + 10, 300, AccessMode::READ_ONLY, missing_handle) ==
+                    StorageResult::PAGE_NOT_RESIDENT && !missing_handle.owns_pin() &&
+                    pool.is_page_loading(FIRST_DATA_PAGE_ID + 10) &&
+                    pool.free_frame_count() == free_frames_before_miss - 1,
+                "The first cache miss reserves a LOADING frame without modifying the output handle");
+    TEST_ASSERT(pool.pin_page(FIRST_DATA_PAGE_ID + 10, 301, AccessMode::READ_ONLY, missing_handle) ==
+                    StorageResult::LOAD_IN_PROGRESS,
+                "A second operation joins the existing page load");
+    TEST_ASSERT(pool.complete_page_load(FIRST_DATA_PAGE_ID + 10) == StorageResult::SUCCESS &&
+                    pool.release_page(FIRST_DATA_PAGE_ID + 10) == StorageResult::SUCCESS,
+                "A reserved load can complete and return its frame to the free list");
+
     {
         PageHandle read_handle;
         TEST_ASSERT(pool.pin_page(FIRST_DATA_PAGE_ID, 100, AccessMode::READ_ONLY, read_handle) ==

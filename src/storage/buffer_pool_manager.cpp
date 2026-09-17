@@ -203,11 +203,26 @@ StorageResult BufferPoolManager::pin_page(page_id_t page_id,
 
     const auto frame_id = find_frame_by_page_id(page_id);
     if (!frame_id.has_value()) {
+        frame_id_t loading_frame = 0;
+        const StorageResult load_result = begin_page_load(page_id, loading_frame);
+        if (load_result != StorageResult::SUCCESS) return load_result;
+        try {
+            const StorageResult waiter_result = register_load_waiter(page_id, operation_id);
+            if (waiter_result != StorageResult::SUCCESS) {
+                discard_loading_frame(page_id);
+                return waiter_result;
+            }
+        } catch (...) {
+            discard_loading_frame(page_id);
+            throw;
+        }
         return StorageResult::PAGE_NOT_RESIDENT;
     }
 
     FrameDescriptor& descriptor = frames_[*frame_id].descriptor;
     if (descriptor.state == BufferFrameState::LOADING) {
+        const StorageResult waiter_result = register_load_waiter(page_id, operation_id);
+        if (waiter_result != StorageResult::SUCCESS) return waiter_result;
         return StorageResult::LOAD_IN_PROGRESS;
     }
     if (!is_resident_state(descriptor.state) || descriptor.state == BufferFrameState::FLUSHING) {
@@ -301,6 +316,37 @@ const uint8_t* BufferPoolManager::get_frame_bytes(frame_id_t frame_id) const noe
 
 bool BufferPoolManager::is_valid_page_id(page_id_t page_id) noexcept {
     return page_id >= 0 && page_id <= MAX_DATA_PAGE_ID;
+}
+
+StorageResult BufferPoolManager::register_load_waiter(page_id_t page_id,
+                                                       operation_id_t operation_id) {
+    auto& waiters = loading_waiters_[page_id];
+    if (std::find(waiters.begin(), waiters.end(), operation_id) != waiters.end()) {
+        return StorageResult::INVALID_ARGUMENT;
+    }
+    waiters.push_back(operation_id);
+    return StorageResult::SUCCESS;
+}
+
+void BufferPoolManager::unregister_load_waiter(page_id_t page_id,
+                                               operation_id_t operation_id) noexcept {
+    const auto waiter_it = loading_waiters_.find(page_id);
+    if (waiter_it == loading_waiters_.end()) return;
+    auto& waiters = waiter_it->second;
+    waiters.erase(std::remove(waiters.begin(), waiters.end(), operation_id), waiters.end());
+    if (waiters.empty()) loading_waiters_.erase(waiter_it);
+}
+
+void BufferPoolManager::discard_loading_frame(page_id_t page_id) noexcept {
+    const auto frame_id = find_frame_by_page_id(page_id);
+    if (!frame_id.has_value()) return;
+    FrameDescriptor& descriptor = frames_[*frame_id].descriptor;
+    if (descriptor.state != BufferFrameState::LOADING || descriptor.pin_count != 0) return;
+    loading_waiters_.erase(page_id);
+    page_to_frame_.erase(page_id);
+    descriptor = FrameDescriptor{};
+    descriptor.frame_id = *frame_id;
+    free_frames_.push_back(*frame_id);
 }
 
 StorageResult BufferPoolManager::release_pin_token(pin_token_t pin_token,

@@ -308,6 +308,11 @@ private:
     std::unordered_map<operation_id_t, std::vector<pin_token_t>> operation_pins_;
     pin_token_t next_pin_token_{1};
 
+    // Operations waiting for a page whose frame is LOADING. The first miss
+    // reserves the frame and adds its operation here; later misses join this
+    // list instead of creating duplicate load requests.
+    std::unordered_map<page_id_t, std::vector<operation_id_t>> loading_waiters_;
+
     // Clock replacement cursor. Step 1 initializes it; later steps advance it
     // during bounded second-chance victim selection.
     frame_id_t clock_hand_{0};
@@ -331,6 +336,9 @@ private:
     const Frame* find_frame(page_id_t page_id) const noexcept;
     static bool is_valid_page_id(page_id_t page_id) noexcept;
     StorageResult release_pin_token(pin_token_t pin_token, operation_id_t operation_id) noexcept;
+    StorageResult register_load_waiter(page_id_t page_id, operation_id_t operation_id);
+    void unregister_load_waiter(page_id_t page_id, operation_id_t operation_id) noexcept;
+    void discard_loading_frame(page_id_t page_id) noexcept;
 };
 
 } // namespace webdb
