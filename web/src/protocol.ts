@@ -19,8 +19,20 @@ export enum SchedulerStatus {
 
 export enum StorageResult {
   Success = 0,
+  PageFull = 1,
+  TupleTooLarge = 2,
+  SlotNotFound = 3,
+  CorruptedPage = 4,
+  VersionMismatch = 5,
+  SchemaMismatch = 6,
   InvalidArgument = 7,
+  CycleDetected = 8,
   IoError = 9,
+  BufferFull = 10,
+  PageNotResident = 11,
+  LoadInProgress = 12,
+  Busy = 13,
+  FlushRequired = 14,
 }
 
 export interface AsyncPageStore {

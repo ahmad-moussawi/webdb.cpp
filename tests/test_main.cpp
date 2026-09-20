@@ -11,6 +11,8 @@ void test_slotted_page();
 void test_async_page_store();
 #elif defined(WEBDB_TEST_OPERATION_SCHEDULER)
 void test_operation_scheduler();
+#elif defined(WEBDB_TEST_BUFFER_POOL_MANAGER)
+void test_buffer_pool_manager();
 #elif defined(WEBDB_TEST_TUPLE)
 void test_tuple_and_3vl();
 #elif defined(WEBDB_TEST_TABLE_HEAP)
@@ -33,6 +35,8 @@ int main() {
     webdb::test::test_async_page_store();
 #elif defined(WEBDB_TEST_OPERATION_SCHEDULER)
     webdb::test::test_operation_scheduler();
+#elif defined(WEBDB_TEST_BUFFER_POOL_MANAGER)
+    webdb::test::test_buffer_pool_manager();
 #elif defined(WEBDB_TEST_TUPLE)
     webdb::test::test_tuple_and_3vl();
 #elif defined(WEBDB_TEST_TABLE_HEAP)

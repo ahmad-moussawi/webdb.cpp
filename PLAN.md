@@ -108,6 +108,8 @@ Phase 2 establishes asynchronous page delivery and page-batch durability. Buffer
 ### Phase 3: Buffer Pool Manager with Async I/O Awareness
 **Objective**: Buffer frames with explicit page states, pin tracking during async pauses, and scan-resistant eviction.
 
+> **Detailed implementation plan**: [plans/03_buffer_pool_manager.md](plans/03_buffer_pool_manager.md)
+
 - [ ] **3.1 Page Frame States & Pin Lifecycle**
   - Explicit frame states:
     - `ABSENT`: Frame is unallocated or empty.
@@ -124,7 +126,7 @@ Phase 2 establishes asynchronous page delivery and page-batch durability. Buffer
 - [ ] **3.3 Buffer Pool API**
   - `PinPage(page_id_t, out_page)`: Returns `RESIDENT` page pointer, or registers a `PAGE_FAULT` if `ABSENT`.
   - `UnpinPage(page_id_t, bool is_dirty)`: Decrements pin count; sets dirty flag.
-  - `NewPage(out_page_id)`: Allocates new page from free list.
+  - `NewPage(expected_page_id, out_page)`: Allocates and zero-initializes a new `DIRTY` page frame without a host read; durable page-count/free-list publication remains later work.
   - `CollectDirtyPages()`: Gathers dirty frames into batch for the async flush cycle.
 
 ---

@@ -25,6 +25,7 @@ endif()
 add_library(webdb_core STATIC
     src/engine.cpp
     src/common/checksum.cpp
+    src/storage/buffer_pool_manager.cpp
     src/storage/master_page.cpp
     src/storage/operation_scheduler.cpp
     src/storage/slotted_page.cpp
@@ -109,6 +110,7 @@ else()
     add_storage_test(test_slotted_page tests/test_slotted_page.cpp WEBDB_TEST_SLOTTED_PAGE slotted_page)
     add_storage_test(test_async_page_store tests/test_async_page_store.cpp WEBDB_TEST_ASYNC_PAGE_STORE async_page_store)
     add_storage_test(test_operation_scheduler tests/test_operation_scheduler.cpp WEBDB_TEST_OPERATION_SCHEDULER operation_scheduler)
+    add_storage_test(test_buffer_pool_manager tests/test_buffer_pool_manager.cpp WEBDB_TEST_BUFFER_POOL_MANAGER buffer_pool_manager)
     add_storage_test(test_tuple tests/test_tuple.cpp WEBDB_TEST_TUPLE tuple)
     add_storage_test(test_table_heap tests/test_table_heap.cpp WEBDB_TEST_TABLE_HEAP table_heap)
 endif()

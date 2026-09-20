@@ -117,8 +117,20 @@ class WasmOperationScheduler {
 EMSCRIPTEN_BINDINGS(webdb_module) {
     enum_<StorageResult>("StorageResult")
         .value("SUCCESS", StorageResult::SUCCESS)
+        .value("PAGE_FULL", StorageResult::PAGE_FULL)
+        .value("TUPLE_TOO_LARGE", StorageResult::TUPLE_TOO_LARGE)
+        .value("SLOT_NOT_FOUND", StorageResult::SLOT_NOT_FOUND)
+        .value("CORRUPTED_PAGE", StorageResult::CORRUPTED_PAGE)
+        .value("VERSION_MISMATCH", StorageResult::VERSION_MISMATCH)
+        .value("SCHEMA_MISMATCH", StorageResult::SCHEMA_MISMATCH)
         .value("INVALID_ARGUMENT", StorageResult::INVALID_ARGUMENT)
-        .value("IO_ERROR", StorageResult::IO_ERROR);
+        .value("CYCLE_DETECTED", StorageResult::CYCLE_DETECTED)
+        .value("IO_ERROR", StorageResult::IO_ERROR)
+        .value("BUFFER_FULL", StorageResult::BUFFER_FULL)
+        .value("PAGE_NOT_RESIDENT", StorageResult::PAGE_NOT_RESIDENT)
+        .value("LOAD_IN_PROGRESS", StorageResult::LOAD_IN_PROGRESS)
+        .value("BUSY", StorageResult::BUSY)
+        .value("FLUSH_REQUIRED", StorageResult::FLUSH_REQUIRED);
 
     enum_<SchedulerStatus>("SchedulerStatus")
         .value("READY", SchedulerStatus::READY)
