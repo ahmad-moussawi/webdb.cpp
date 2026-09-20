@@ -299,6 +299,7 @@ StorageResult BufferPoolManager::mark_page_dirty(pin_token_t pin_token, operatio
 }
 
 StorageResult BufferPoolManager::release_operation_pins(operation_id_t operation_id) noexcept {
+    unregister_operation_load_waiters(operation_id);
     const auto operation_it = operation_pins_.find(operation_id);
 
     if (operation_it == operation_pins_.end()) {
@@ -334,10 +335,9 @@ bool BufferPoolManager::is_valid_page_id(page_id_t page_id) noexcept {
 
 StorageResult BufferPoolManager::register_load_waiter(page_id_t page_id, operation_id_t operation_id) {
     auto& waiters = loading_waiters_[page_id];
-    if (std::find(waiters.begin(), waiters.end(), operation_id) != waiters.end()) {
-        return StorageResult::INVALID_ARGUMENT;
+    if (std::find(waiters.begin(), waiters.end(), operation_id) == waiters.end()) {
+        waiters.push_back(operation_id);
     }
-    waiters.push_back(operation_id);
     return StorageResult::SUCCESS;
 }
 
@@ -347,6 +347,20 @@ void BufferPoolManager::unregister_load_waiter(page_id_t page_id, operation_id_t
     auto& waiters = waiter_it->second;
     waiters.erase(std::remove(waiters.begin(), waiters.end(), operation_id), waiters.end());
     if (waiters.empty()) loading_waiters_.erase(waiter_it);
+}
+
+void BufferPoolManager::unregister_operation_load_waiters(operation_id_t operation_id) noexcept {
+    for (auto waiter_it = loading_waiters_.begin(); waiter_it != loading_waiters_.end();) {
+        auto& waiters = waiter_it->second;
+
+        waiters.erase(std::remove(waiters.begin(), waiters.end(), operation_id), waiters.end());
+
+        if (waiters.empty()) {
+            waiter_it = loading_waiters_.erase(waiter_it);
+        } else {
+            ++waiter_it;
+        }
+    }
 }
 
 void BufferPoolManager::discard_loading_frame(page_id_t page_id) noexcept {
@@ -414,6 +428,31 @@ const BufferPoolManager::Frame* BufferPoolManager::find_frame(page_id_t page_id)
     return frame_id.has_value() ? &frames_[*frame_id] : nullptr;
 }
 
+bool BufferPoolManager::select_clean_victim(frame_id_t& out_frame_id) noexcept {
+    const size_t max_inspections = frames_.size() * 2;
+
+    for (size_t inspection = 0; inspection < max_inspections; ++inspection) {
+        const frame_id_t frame_id = clock_hand_;
+        clock_hand_ = static_cast<frame_id_t>((static_cast<size_t>(clock_hand_) + 1) % frames_.size());
+
+        FrameDescriptor& descriptor = frames_[frame_id].descriptor;
+
+        if (descriptor.state != BufferFrameState::RESIDENT || descriptor.pin_count != 0) {
+            continue;
+        }
+
+        if (descriptor.ref_bit) {
+            descriptor.ref_bit = false;
+            continue;
+        }
+
+        out_frame_id = frame_id;
+        return true;
+    }
+
+    return false;
+}
+
 // Assigns one currently ABSENT frame to a new logical page mapping. This is the
 // common reservation path for both begin_page_load() and the synchronous
 // load_page() test helper: the former requests LOADING and the latter requests
@@ -433,14 +472,55 @@ StorageResult BufferPoolManager::assign_frame(page_id_t page_id, BufferFrameStat
     if (page_to_frame_.find(page_id) != page_to_frame_.end()) {
         return StorageResult::INVALID_ARGUMENT;
     }
-    if (free_frames_.empty()) return StorageResult::BUFFER_FULL;
+    frame_id_t frame_id = 0;
+    const bool using_free_frame = !free_frames_.empty();
+    const frame_id_t clock_hand_before = clock_hand_;
+    std::vector<bool> ref_bits_before;
 
-    const frame_id_t frame_id = free_frames_.back();
+    if (!using_free_frame) {
+        ref_bits_before.reserve(frames_.size());
+        
+        for (const Frame& frame : frames_) {
+            ref_bits_before.push_back(frame.descriptor.ref_bit);
+        }
+    }
+
+    const auto restore_clock_state = [&]() noexcept {
+        if (using_free_frame) return;
+        clock_hand_ = clock_hand_before;
+
+        for (size_t index = 0; index < frames_.size(); ++index) {
+            frames_[index].descriptor.ref_bit = ref_bits_before[index];
+        }
+    };
+
+    if (using_free_frame) {
+        frame_id = free_frames_.back();
+    } else if (!select_clean_victim(frame_id)) {
+        restore_clock_state();
+        return StorageResult::BUFFER_FULL;
+    }
+
     // Insert first: unordered_map::emplace may allocate and throw. Keeping the
     // free list and descriptor untouched until insertion succeeds preserves the
     // frame-table invariants if allocation fails.
-    const auto insertion = page_to_frame_.emplace(page_id, frame_id);
-    if (!insertion.second) return StorageResult::INVALID_ARGUMENT;
+    std::pair<std::unordered_map<page_id_t, frame_id_t>::iterator, bool> insertion;
+    try {
+        insertion = page_to_frame_.emplace(page_id, frame_id);
+    } catch (...) {
+        restore_clock_state();
+        throw;
+    }
+    if (!insertion.second) {
+        restore_clock_state();
+        return StorageResult::INVALID_ARGUMENT;
+    }
+
+    if (using_free_frame) {
+        free_frames_.pop_back();
+    } else {
+        page_to_frame_.erase(frames_[frame_id].descriptor.page_id);
+    }
 
     FrameDescriptor& descriptor = frames_[frame_id].descriptor;
     descriptor.page_id = page_id;
@@ -449,7 +529,7 @@ StorageResult BufferPoolManager::assign_frame(page_id_t page_id, BufferFrameStat
     descriptor.ref_bit = false;
     descriptor.dirty_generation = 0;
     descriptor.flushing_generation = 0;
-    free_frames_.pop_back();
+    descriptor.flushing_batch_id = 0;
     out_frame_id = frame_id;
     return StorageResult::SUCCESS;
 }
@@ -461,18 +541,97 @@ StorageResult BufferPoolManager::begin_page_load(page_id_t page_id, frame_id_t& 
         if (existing->descriptor.state == BufferFrameState::LOADING) {
             return StorageResult::LOAD_IN_PROGRESS;
         }
+
         return existing->descriptor.state == BufferFrameState::FLUSHING ? StorageResult::BUSY
                                                                         : StorageResult::INVALID_ARGUMENT;
     }
+
+    if (loading_count() >= config_.max_pending_loads) {
+        return StorageResult::BUSY;
+    }
+
     return assign_frame(page_id, BufferFrameState::LOADING, out_frame_id);
 }
 
-StorageResult BufferPoolManager::complete_page_load(page_id_t page_id) {
+StorageResult BufferPoolManager::complete_page_load(page_id_t page_id, const std::vector<uint8_t>& bytes,
+                                                    std::vector<operation_id_t>& out_woken_operations) {
+    return provide_page(page_id, bytes, out_woken_operations);
+}
+
+StorageResult BufferPoolManager::provide_page(page_id_t page_id, const std::vector<uint8_t>& bytes,
+                                              std::vector<operation_id_t>& out_woken_operations) {
+    if (!is_valid_page_id(page_id) || bytes.size() != DATABASE_PAGE_SIZE) {
+        return StorageResult::INVALID_ARGUMENT;
+    }
+
     Frame* frame = find_frame(page_id);
-    if (frame == nullptr) return StorageResult::INVALID_ARGUMENT;
-    if (frame->descriptor.state != BufferFrameState::LOADING) return StorageResult::INVALID_ARGUMENT;
+
+    if (frame == nullptr || frame->descriptor.state != BufferFrameState::LOADING) {
+        return StorageResult::INVALID_ARGUMENT;
+    }
+
+    const auto waiter_it = loading_waiters_.find(page_id);
+    std::vector<operation_id_t> woken_operations;
+
+    if (waiter_it != loading_waiters_.end()) {
+        woken_operations = waiter_it->second;
+        loading_waiters_.erase(waiter_it);
+    }
+
+    std::copy(bytes.begin(), bytes.end(), get_frame_bytes(frame->descriptor.frame_id));
+    out_woken_operations = std::move(woken_operations);
+    frame->descriptor.ref_bit = true;
     frame->descriptor.state = BufferFrameState::RESIDENT;
     return StorageResult::SUCCESS;
+}
+
+StorageResult BufferPoolManager::abort_page_load(page_id_t page_id,
+                                                 std::vector<operation_id_t>& out_failed_operations) {
+    if (!is_valid_page_id(page_id)) {
+        return StorageResult::INVALID_ARGUMENT;
+    }
+
+    const auto frame_id = find_frame_by_page_id(page_id);
+
+    if (!frame_id.has_value()) {
+        return StorageResult::INVALID_ARGUMENT;
+    }
+
+    FrameDescriptor& descriptor = frames_[*frame_id].descriptor;
+
+    if (descriptor.state != BufferFrameState::LOADING || descriptor.pin_count != 0) {
+        return StorageResult::INVALID_ARGUMENT;
+    }
+
+    const auto waiter_it = loading_waiters_.find(page_id);
+    std::vector<operation_id_t> failed_operations;
+
+    if (waiter_it != loading_waiters_.end()) {
+        failed_operations = waiter_it->second;
+        loading_waiters_.erase(waiter_it);
+    }
+    
+    out_failed_operations = std::move(failed_operations);
+    page_to_frame_.erase(page_id);
+    descriptor = FrameDescriptor{};
+    descriptor.frame_id = *frame_id;
+    free_frames_.push_back(*frame_id);
+
+    return StorageResult::SUCCESS;
+}
+
+std::vector<page_id_t> BufferPoolManager::get_pending_page_ids() const {
+    std::vector<page_id_t> page_ids;
+    page_ids.reserve(page_to_frame_.size());
+
+    for (const auto& [page_id, frame_id] : page_to_frame_) {
+        if (frames_[frame_id].descriptor.state == BufferFrameState::LOADING) {
+            page_ids.push_back(page_id);
+        }
+    }
+
+    std::sort(page_ids.begin(), page_ids.end());
+    return page_ids;
 }
 
 StorageResult BufferPoolManager::load_page(page_id_t page_id, frame_id_t& out_frame_id) {

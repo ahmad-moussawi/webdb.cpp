@@ -244,10 +244,26 @@ public:
     // rejected instead of creating a second mutable copy.
     StorageResult begin_page_load(page_id_t page_id, frame_id_t& out_frame_id);
 
-    // Completes a synchronous/test page load by transitioning LOADING to
-    // RESIDENT. The page bytes are supplied by the minimal test backend in a
-    // later step; this Step 1 operation establishes lifecycle ownership only.
-    StorageResult complete_page_load(page_id_t page_id);
+    // Completes a page load by copying exactly one page into the matching
+    // LOADING frame and returning every operation waiting for that page.
+    StorageResult complete_page_load(page_id_t page_id,
+                                     const std::vector<uint8_t>& bytes,
+                                     std::vector<operation_id_t>& out_woken_operations);
+
+    // Supplies exactly one host page to a matching LOADING frame and returns
+    // every operation waiting for that page. The frame owns a copy of bytes.
+    StorageResult provide_page(page_id_t page_id,
+                               const std::vector<uint8_t>& bytes,
+                               std::vector<operation_id_t>& out_woken_operations);
+
+    // Aborts a matching LOADING frame, returns its waiters, and recycles the
+    // frame as ABSENT so a later request can retry the load.
+    StorageResult abort_page_load(page_id_t page_id,
+                                  std::vector<operation_id_t>& out_failed_operations);
+
+    // Returns every page currently reserved in a LOADING frame, including
+    // loads whose waiters were cancelled but whose host request is still open.
+    std::vector<page_id_t> get_pending_page_ids() const;
 
     // Synchronously assigns an ABSENT frame as a resident page. This models the
     // Step 1 test backend, which has page bytes available immediately and does
@@ -345,12 +361,14 @@ private:
     StorageResult assign_frame(page_id_t page_id,
                                BufferFrameState state,
                                frame_id_t& out_frame_id);
+    bool select_clean_victim(frame_id_t& out_frame_id) noexcept;
     Frame* find_frame(page_id_t page_id) noexcept;
     const Frame* find_frame(page_id_t page_id) const noexcept;
     static bool is_valid_page_id(page_id_t page_id) noexcept;
     StorageResult release_pin_token(pin_token_t pin_token, operation_id_t operation_id) noexcept;
     StorageResult register_load_waiter(page_id_t page_id, operation_id_t operation_id);
     void unregister_load_waiter(page_id_t page_id, operation_id_t operation_id) noexcept;
+    void unregister_operation_load_waiters(operation_id_t operation_id) noexcept;
     void discard_loading_frame(page_id_t page_id) noexcept;
 };
 
