@@ -26,7 +26,7 @@ void test_buffer_pool_manager() {
                         descriptor->page_id == INVALID_PAGE_ID &&
                         descriptor->state == BufferFrameState::ABSENT && descriptor->pin_count == 0 &&
                         !descriptor->ref_bit && descriptor->dirty_generation == 0 &&
-                        descriptor->flushing_generation == 0,
+                        descriptor->flushing_generation == 0 && descriptor->flushing_batch_id == 0,
                     "Every frame starts with a clean ABSENT descriptor");
     }
 
@@ -94,9 +94,135 @@ void test_buffer_pool_manager() {
     TEST_ASSERT(pool.pin_page(FIRST_DATA_PAGE_ID + 10, 301, AccessMode::READ_ONLY, missing_handle) ==
                     StorageResult::LOAD_IN_PROGRESS,
                 "A second operation joins the existing page load");
-    TEST_ASSERT(pool.complete_page_load(FIRST_DATA_PAGE_ID + 10) == StorageResult::SUCCESS &&
+    TEST_ASSERT(pool.get_pending_page_ids() == std::vector<page_id_t>{FIRST_DATA_PAGE_ID + 10},
+                "The pool exposes its pending loading page IDs");
+    std::vector<operation_id_t> woken_operations;
+    const std::vector<operation_id_t> expected_woken_operations{300, 301};
+    const std::vector<uint8_t> supplied_bytes(DATABASE_PAGE_SIZE, 0x7B);
+    const load_id_t first_load_id = pool.get_page_load_id(FIRST_DATA_PAGE_ID + 10).value();
+    TEST_ASSERT(pool.provide_page(FIRST_DATA_PAGE_ID + 10,
+                                  first_load_id,
+                                  std::vector<uint8_t>(DATABASE_PAGE_SIZE - 1),
+                                  woken_operations) == StorageResult::INVALID_ARGUMENT &&
+                    pool.is_page_loading(FIRST_DATA_PAGE_ID + 10),
+                "Malformed page bytes do not complete a shared load");
+    TEST_ASSERT(pool.provide_page(FIRST_DATA_PAGE_ID + 10, first_load_id, supplied_bytes, woken_operations) ==
+                    StorageResult::SUCCESS &&
+                    woken_operations == expected_woken_operations &&
+                    pool.is_page_resident(FIRST_DATA_PAGE_ID + 10) &&
+                    pool.get_frame_descriptor(pool.find_frame_by_page_id(FIRST_DATA_PAGE_ID + 10).value())
+                            ->ref_bit,
+                "One supplied page wakes every waiter and becomes resident");
+    PageHandle supplied_handle;
+    TEST_ASSERT(pool.pin_page(FIRST_DATA_PAGE_ID + 10, 302, AccessMode::READ_ONLY, supplied_handle) ==
+                    StorageResult::SUCCESS && supplied_handle.data()[0] == 0x7B,
+                "Supplied bytes are copied into the pool-owned frame");
+    supplied_handle.reset();
+    TEST_ASSERT(pool.release_operation_pins(300) == StorageResult::SUCCESS &&
+                    pool.release_operation_pins(301) == StorageResult::SUCCESS &&
                     pool.release_page(FIRST_DATA_PAGE_ID + 10) == StorageResult::SUCCESS,
-                "A reserved load can complete and return its frame to the free list");
+                "A completed shared load can return its frame to the free list");
+
+    PageHandle aborted_handle;
+    TEST_ASSERT(pool.pin_page(FIRST_DATA_PAGE_ID + 11, 303, AccessMode::READ_ONLY, aborted_handle) ==
+                    StorageResult::PAGE_NOT_RESIDENT,
+                "A new page miss creates another shared load reservation");
+    TEST_ASSERT(pool.release_operation_pins(303) == StorageResult::SUCCESS,
+                "Cancelling a load waiter removes only that operation from the waiter registry");
+    TEST_ASSERT(pool.pin_page(FIRST_DATA_PAGE_ID + 11, 304, AccessMode::READ_ONLY, aborted_handle) ==
+                    StorageResult::LOAD_IN_PROGRESS,
+                "A remaining load reservation accepts a new waiter");
+    std::vector<operation_id_t> failed_operations;
+    const load_id_t second_load_id = pool.get_page_load_id(FIRST_DATA_PAGE_ID + 11).value();
+    TEST_ASSERT(pool.abort_page_load(FIRST_DATA_PAGE_ID + 11, second_load_id, failed_operations) == StorageResult::SUCCESS &&
+                    failed_operations == std::vector<operation_id_t>(1, 304) &&
+                    !pool.find_frame_by_page_id(FIRST_DATA_PAGE_ID + 11).has_value() &&
+                    pool.free_frame_count() == free_frames_before_miss,
+                "Aborting a load wakes remaining waiters and recycles the frame");
+    TEST_ASSERT(pool.pin_page(FIRST_DATA_PAGE_ID + 11, 305, AccessMode::READ_ONLY, aborted_handle) ==
+                    StorageResult::PAGE_NOT_RESIDENT,
+                "An aborted load can be retried");
+    const load_id_t retry_load_id = pool.get_page_load_id(FIRST_DATA_PAGE_ID + 11).value();
+    TEST_ASSERT(pool.abort_page_load(FIRST_DATA_PAGE_ID + 11, retry_load_id, failed_operations) == StorageResult::SUCCESS,
+                "A retried load can be aborted cleanly");
+
+    TEST_ASSERT(pool.pin_page(FIRST_DATA_PAGE_ID + 12, 306, AccessMode::READ_ONLY, aborted_handle) ==
+                    StorageResult::PAGE_NOT_RESIDENT &&
+                    pool.pin_page(FIRST_DATA_PAGE_ID + 12, 306, AccessMode::READ_ONLY, aborted_handle) ==
+                        StorageResult::LOAD_IN_PROGRESS,
+                "Retrying the same loading page is idempotent for its waiter");
+    const load_id_t third_load_id = pool.get_page_load_id(FIRST_DATA_PAGE_ID + 12).value();
+    TEST_ASSERT(pool.abort_page_load(FIRST_DATA_PAGE_ID + 12, third_load_id, failed_operations) == StorageResult::SUCCESS,
+                "An idempotent load retry can be cleaned up");
+
+    BufferPoolManager late_supply_pool(BufferPoolConfig{1, 1, 1});
+    PageHandle late_supply_handle;
+    TEST_ASSERT(late_supply_pool.pin_page(FIRST_DATA_PAGE_ID, 501, AccessMode::READ_ONLY, late_supply_handle) ==
+                    StorageResult::PAGE_NOT_RESIDENT &&
+                    late_supply_pool.release_operation_pins(501) == StorageResult::SUCCESS,
+                "Cancelling the only load waiter leaves the host load reservation active");
+    const load_id_t late_supply_load_id = late_supply_pool.get_page_load_id(FIRST_DATA_PAGE_ID).value();
+    TEST_ASSERT(late_supply_pool.get_pending_page_ids() == std::vector<page_id_t>{FIRST_DATA_PAGE_ID},
+                "Cancelled loads remain visible until the host completes or aborts them");
+    std::vector<operation_id_t> late_woken_operations{999};
+    TEST_ASSERT(late_supply_pool.provide_page(FIRST_DATA_PAGE_ID,
+                                              late_supply_load_id,
+                                              std::vector<uint8_t>(DATABASE_PAGE_SIZE, 0x4D),
+                                              late_woken_operations) == StorageResult::SUCCESS &&
+                    late_woken_operations.empty() && late_supply_pool.is_page_resident(FIRST_DATA_PAGE_ID) &&
+                    late_supply_pool.release_page(FIRST_DATA_PAGE_ID) == StorageResult::SUCCESS,
+                "A late successful supply resolves a cancelled load without leaking its frame");
+
+    BufferPoolManager late_abort_pool(BufferPoolConfig{1, 1, 1});
+    PageHandle late_abort_handle;
+    TEST_ASSERT(late_abort_pool.pin_page(FIRST_DATA_PAGE_ID, 502, AccessMode::READ_ONLY, late_abort_handle) ==
+                    StorageResult::PAGE_NOT_RESIDENT &&
+                    late_abort_pool.release_operation_pins(502) == StorageResult::SUCCESS,
+                "The only waiter can cancel before a host load failure");
+    const load_id_t late_abort_load_id = late_abort_pool.get_page_load_id(FIRST_DATA_PAGE_ID).value();
+    std::vector<operation_id_t> late_failed_operations{999};
+    TEST_ASSERT(late_abort_pool.abort_page_load(FIRST_DATA_PAGE_ID, late_abort_load_id, late_failed_operations) ==
+                    StorageResult::SUCCESS &&
+                    late_failed_operations.empty() &&
+                    !late_abort_pool.find_frame_by_page_id(FIRST_DATA_PAGE_ID).has_value() &&
+                    late_abort_pool.free_frame_count() == 1,
+                "A late load failure recycles a cancelled load frame");
+    TEST_ASSERT(late_abort_pool.pin_page(FIRST_DATA_PAGE_ID, 505, AccessMode::READ_ONLY, late_abort_handle) ==
+                    StorageResult::PAGE_NOT_RESIDENT,
+                "The same page can start a new load after abort");
+    const load_id_t retried_load_id = late_abort_pool.get_page_load_id(FIRST_DATA_PAGE_ID).value();
+    std::vector<operation_id_t> stale_woken_operations;
+    TEST_ASSERT(retried_load_id != late_abort_load_id &&
+                    late_abort_pool.provide_page(FIRST_DATA_PAGE_ID, late_abort_load_id,
+                                                  std::vector<uint8_t>(DATABASE_PAGE_SIZE, 0x11),
+                                                  stale_woken_operations) == StorageResult::INVALID_ARGUMENT &&
+                    late_abort_pool.is_page_loading(FIRST_DATA_PAGE_ID),
+                "A stale response cannot complete a retried page load");
+    TEST_ASSERT(late_abort_pool.provide_page(FIRST_DATA_PAGE_ID, retried_load_id,
+                                              std::vector<uint8_t>(DATABASE_PAGE_SIZE, 0x22),
+                                              stale_woken_operations) == StorageResult::SUCCESS,
+                "The active load identity can complete the retried load");
+    late_abort_pool.release_operation_pins(505);
+    late_abort_pool.release_page(FIRST_DATA_PAGE_ID);
+
+    BufferPoolManager pending_limit_pool(BufferPoolConfig{2, 1, 1});
+    PageHandle pending_limit_handle;
+    TEST_ASSERT(pending_limit_pool.pin_page(FIRST_DATA_PAGE_ID, 503, AccessMode::READ_ONLY,
+                                             pending_limit_handle) == StorageResult::PAGE_NOT_RESIDENT &&
+                    pending_limit_pool.pin_page(FIRST_DATA_PAGE_ID + 1, 504, AccessMode::READ_ONLY,
+                                                pending_limit_handle) == StorageResult::BUSY &&
+                    pending_limit_pool.loading_count() == 1,
+                "The pending-load limit prevents a second concurrent page load");
+    const load_id_t pending_load_id = pending_limit_pool.get_page_load_id(FIRST_DATA_PAGE_ID).value();
+    TEST_ASSERT(pending_limit_pool.abort_page_load(FIRST_DATA_PAGE_ID, pending_load_id, late_failed_operations) ==
+                    StorageResult::SUCCESS &&
+                    pending_limit_pool.pin_page(FIRST_DATA_PAGE_ID + 1, 504, AccessMode::READ_ONLY,
+                                                pending_limit_handle) == StorageResult::PAGE_NOT_RESIDENT,
+                "A pending-load slot becomes available after the active load is aborted");
+    const load_id_t replacement_load_id = pending_limit_pool.get_page_load_id(FIRST_DATA_PAGE_ID + 1).value();
+    TEST_ASSERT(pending_limit_pool.abort_page_load(FIRST_DATA_PAGE_ID + 1, replacement_load_id, late_failed_operations) ==
+                    StorageResult::SUCCESS,
+                "The replacement pending load can be cleaned up");
 
     {
         PageHandle read_handle;
@@ -216,15 +342,24 @@ void test_buffer_pool_manager() {
     }
 
     frame_id_t loading_frame = 0;
-    TEST_ASSERT(pool.begin_page_load(FIRST_DATA_PAGE_ID + 1, loading_frame) == StorageResult::SUCCESS,
+    load_id_t synchronous_load_id = 0;
+    TEST_ASSERT(pool.begin_page_load(FIRST_DATA_PAGE_ID + 1, loading_frame, synchronous_load_id) ==
+                    StorageResult::SUCCESS,
                 "An ABSENT frame can enter LOADING");
     TEST_ASSERT(pool.is_page_loading(FIRST_DATA_PAGE_ID + 1) && pool.loading_count() == 1,
                 "LOADING pages are visible to inspection methods");
     frame_id_t joined_frame = 0;
-    TEST_ASSERT(pool.begin_page_load(FIRST_DATA_PAGE_ID + 1, joined_frame) == StorageResult::LOAD_IN_PROGRESS,
+    load_id_t joined_load_id = 0;
+    TEST_ASSERT(pool.begin_page_load(FIRST_DATA_PAGE_ID + 1, joined_frame, joined_load_id) ==
+                    StorageResult::LOAD_IN_PROGRESS && joined_load_id == synchronous_load_id,
                 "A duplicate load joins the existing page load");
-    TEST_ASSERT(pool.complete_page_load(FIRST_DATA_PAGE_ID + 1) == StorageResult::SUCCESS,
-                "A synchronous page supply transitions LOADING to RESIDENT");
+    std::vector<operation_id_t> synchronous_woken_operations;
+    TEST_ASSERT(pool.complete_page_load(FIRST_DATA_PAGE_ID + 1,
+                                        synchronous_load_id,
+                                        std::vector<uint8_t>(DATABASE_PAGE_SIZE, 0x2A),
+                                        synchronous_woken_operations) == StorageResult::SUCCESS &&
+                    synchronous_woken_operations.empty(),
+                "A page supply transitions LOADING to RESIDENT without discarding waiters");
     TEST_ASSERT(pool.is_page_resident(FIRST_DATA_PAGE_ID + 1) && pool.loading_count() == 0,
                 "Completed loads leave no LOADING frame behind");
 
@@ -281,6 +416,64 @@ void test_buffer_pool_manager() {
                 "Released pages return their frame to the free list");
     TEST_ASSERT(pool.release_page(FIRST_DATA_PAGE_ID + 1) == StorageResult::INVALID_ARGUMENT,
                 "Dirty pages cannot be released without a flush");
+
+    BufferPoolManager clock_pool(BufferPoolConfig{2, 2, 2});
+    frame_id_t first_clock_frame = 0;
+    frame_id_t second_clock_frame = 0;
+    TEST_ASSERT(clock_pool.load_page(FIRST_DATA_PAGE_ID, first_clock_frame) == StorageResult::SUCCESS &&
+                    clock_pool.load_page(FIRST_DATA_PAGE_ID + 1, second_clock_frame) == StorageResult::SUCCESS,
+                "A full pool can load its initial clean working set");
+    TEST_ASSERT(clock_pool.load_page(FIRST_DATA_PAGE_ID + 2, first_clock_frame) == StorageResult::SUCCESS &&
+                    !clock_pool.find_frame_by_page_id(FIRST_DATA_PAGE_ID + 1).has_value() &&
+                    clock_pool.find_frame_by_page_id(FIRST_DATA_PAGE_ID + 2).value() == second_clock_frame,
+                "Clock eviction reuses an unpinned clean frame without stale page mappings");
+
+    BufferPoolManager second_chance_pool(BufferPoolConfig{2, 2, 2});
+    frame_id_t second_chance_first = 0;
+    frame_id_t second_chance_second = 0;
+    TEST_ASSERT(second_chance_pool.load_page(FIRST_DATA_PAGE_ID, second_chance_first) == StorageResult::SUCCESS &&
+                    second_chance_pool.load_page(FIRST_DATA_PAGE_ID + 1, second_chance_second) ==
+                        StorageResult::SUCCESS,
+                "A second pool can establish a full working set");
+    {
+        PageHandle first_hot_pin;
+        PageHandle second_hot_pin;
+        TEST_ASSERT(second_chance_pool.pin_page(FIRST_DATA_PAGE_ID, 401, AccessMode::READ_ONLY, first_hot_pin) ==
+                        StorageResult::SUCCESS &&
+                        second_chance_pool.pin_page(FIRST_DATA_PAGE_ID + 1, 402, AccessMode::READ_ONLY,
+                                                    second_hot_pin) == StorageResult::SUCCESS,
+                    "Accessing both pages sets their Clock reference bits");
+    }
+    TEST_ASSERT(second_chance_pool.load_page(FIRST_DATA_PAGE_ID + 2, first_clock_frame) == StorageResult::SUCCESS &&
+                    second_chance_pool.find_frame_by_page_id(FIRST_DATA_PAGE_ID).has_value() &&
+                    !second_chance_pool.find_frame_by_page_id(FIRST_DATA_PAGE_ID + 1).has_value() &&
+                    !second_chance_pool.get_frame_descriptor(second_chance_first)->ref_bit,
+                "Clock grants a second chance before evicting a recently referenced page");
+
+    BufferPoolManager protected_pool(BufferPoolConfig{2, 2, 2});
+    frame_id_t protected_first = 0;
+    frame_id_t protected_second = 0;
+    TEST_ASSERT(protected_pool.load_page(FIRST_DATA_PAGE_ID, protected_first) == StorageResult::SUCCESS &&
+                    protected_pool.load_page(FIRST_DATA_PAGE_ID + 1, protected_second) == StorageResult::SUCCESS,
+                "A protected pool can fill both frames");
+    PageHandle protected_first_pin;
+    PageHandle protected_second_pin;
+    TEST_ASSERT(protected_pool.pin_page(FIRST_DATA_PAGE_ID, 403, AccessMode::READ_ONLY, protected_first_pin) ==
+                    StorageResult::SUCCESS &&
+                    protected_pool.pin_page(FIRST_DATA_PAGE_ID + 1, 404, AccessMode::READ_ONLY,
+                                            protected_second_pin) == StorageResult::SUCCESS &&
+                    protected_pool.load_page(FIRST_DATA_PAGE_ID + 2, protected_first) == StorageResult::BUFFER_FULL,
+                "Clock never evicts pinned frames and reports a full pool deterministically");
+    const frame_id_t protected_hand_before = protected_pool.get_clock_hand();
+    const auto protected_first_before = protected_pool.get_frame_descriptor(protected_first);
+    const auto protected_second_before = protected_pool.get_frame_descriptor(protected_second);
+    TEST_ASSERT(protected_pool.load_page(FIRST_DATA_PAGE_ID + 2, protected_first) == StorageResult::BUFFER_FULL &&
+                    protected_pool.get_clock_hand() == protected_hand_before &&
+                    protected_pool.get_frame_descriptor(protected_first)->ref_bit ==
+                        protected_first_before->ref_bit &&
+                    protected_pool.get_frame_descriptor(protected_second)->ref_bit ==
+                        protected_second_before->ref_bit,
+                "Clock preserves replacement state when no victim can be selected");
 
     std::cout << "[PASSED] buffer pool frame table tests" << std::endl;
 }

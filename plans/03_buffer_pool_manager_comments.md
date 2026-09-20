@@ -653,3 +653,113 @@ operation_pins_.erase(operation_it);
 ```
 
 Moving transfers the vector's existing allocation instead of duplicating all token entries, so it is constant-time and non-allocating for the normal `std::vector` move path. The reverse operation index is erased before token release, allowing `release_pin_token()` to perform frame dirtying, handle invalidation, and token removal without rebuilding or modifying that operation's token vector. This preserves the `noexcept` cleanup guarantee while keeping write mutations and pin ownership state intact.
+
+---
+
+## Step 3 Implementation Validation (Clock Eviction) & Step 4 Follow-up Issues
+
+During the revalidation of the latest implementation on branch `phase3_clock_eviction` (`src/include/storage/buffer_pool_manager.hpp`, `src/storage/buffer_pool_manager.cpp`, and `tests/test_buffer_pool_manager.cpp`), Clock replacement has been implemented and verified.
+
+### 1. Step 3: Clock Replacement & Clean Eviction — Validated & Passing
+- **Implementation Verification:**
+  - `select_clean_victim(out_frame_id)` correctly iterates up to `2 * frame_count` inspections starting at `clock_hand_`.
+  - Safely protects `pin_count > 0`, `DIRTY`, `FLUSHING`, and `LOADING` frames from eviction.
+  - Implements second chance by clearing `ref_bit = false` and advancing past recently accessed pages.
+  - Advance cursor: `clock_hand_` advances forward modulo `frame_count`, so subsequent sweeps resume immediately following the selected victim.
+  - Frame reassignment in `assign_frame()` cleanly updates `page_to_frame_` by erasing the evicted page ID and mapping the new page ID in an exception-safe manner.
+  - Comprehensive unit tests verify full working set fill, eviction of clean frames, second-chance retention of referenced pages, and deterministic `BUFFER_FULL` when all frames are pinned.
+- **Status:** **Complete and verified clean.**
+
+---
+
+### Step 4 Follow-up Review (Async Page Loading & Cancellation Edge Cases)
+
+ The following critical issues were identified during review and are addressed by this implementation:
+
+### 2. Critical: Permanent Frame Leak in `provide_page()` When All Waiters Have Cancelled
+- **Location:** `src/storage/buffer_pool_manager.cpp` (in `provide_page()`)
+- **Bug:**
+  ```cpp
+  const auto waiter_it = loading_waiters_.find(page_id);
+  if (waiter_it == loading_waiters_.end()) {
+      return StorageResult::INVALID_ARGUMENT;
+  }
+  ```
+- **Scenario:**
+  1. Operation 1 faults on Page 5. Page 5 enters `LOADING` with waiter `{1}`.
+  2. Operation 1 is cancelled or timed out before the host read finishes. `release_operation_pins(1)` invokes `unregister_operation_load_waiters(1)`, which removes Operation 1.
+  3. Because Operation 1 was the only waiter, `loading_waiters_.erase(waiter_it)` deletes the entry for Page 5 entirely.
+  4. The host coordinator's asynchronous read finishes and delivers page bytes via `provide_page(5, bytes, woken_ops)`.
+  5. `provide_page()` looks for `loading_waiters_.find(5)` and finds nothing, so it returns `StorageResult::INVALID_ARGUMENT`.
+- **Consequence:** The frame remains stuck in `BufferFrameState::LOADING` **forever**. It is never transitioned to `RESIDENT`, never aborted, never freed back to `free_frames_`, and cannot be evicted. Every cancelled load permanently leaks a buffer pool frame until the pool runs out of frames.
+- **Fix:** If `waiter_it == loading_waiters_.end()`, do not fail with `INVALID_ARGUMENT`. Instead, copy the bytes into the frame, set `ref_bit = true`, transition the frame to `BufferFrameState::RESIDENT`, and return `out_woken_operations` as empty (`out_woken_operations.clear()`). This preserves the cached page for future queries and prevents frame leakage:
+  ```cpp
+  std::vector<operation_id_t> woken_operations;
+  if (waiter_it != loading_waiters_.end()) {
+      woken_operations = std::move(waiter_it->second);
+      loading_waiters_.erase(waiter_it);
+  }
+  std::copy(bytes.begin(), bytes.end(), get_frame_bytes(frame->descriptor.frame_id));
+  out_woken_operations = std::move(woken_operations);
+  frame->descriptor.ref_bit = true;
+  frame->descriptor.state = BufferFrameState::RESIDENT;
+  return StorageResult::SUCCESS;
+  ```
+
+### 3. Critical: Permanent Frame Leak in `abort_page_load()` When All Waiters Have Cancelled
+- **Location:** `src/storage/buffer_pool_manager.cpp` (in `abort_page_load()`)
+- **Bug:**
+  ```cpp
+  const auto waiter_it = loading_waiters_.find(page_id);
+  if (waiter_it == loading_waiters_.end()) {
+      return StorageResult::INVALID_ARGUMENT;
+  }
+  ```
+- **Consequence:** If an operation cancels while waiting for a load, and the host subsequently reports a read failure (`abort_page_load()`), the missing waiter entry causes `abort_page_load()` to return `StorageResult::INVALID_ARGUMENT` without recycling the frame. The frame is permanently orphaned in `LOADING` state.
+- **Fix:** Allow `abort_page_load()` to proceed when `waiter_it == loading_waiters_.end()`, returning an empty `out_failed_operations` vector while still cleaning up `page_to_frame_`, resetting the descriptor, and returning the frame to `free_frames_`:
+  ```cpp
+  std::vector<operation_id_t> failed_operations;
+  if (waiter_it != loading_waiters_.end()) {
+      failed_operations = std::move(waiter_it->second);
+      loading_waiters_.erase(waiter_it);
+  }
+  out_failed_operations = std::move(failed_operations);
+  page_to_frame_.erase(page_id);
+  descriptor = FrameDescriptor{};
+  descriptor.frame_id = *frame_id;
+  free_frames_.push_back(*frame_id);
+  return StorageResult::SUCCESS;
+  ```
+
+### 4. Bug: Retrying `pin_page()` on a Loading Page Fails With `INVALID_ARGUMENT`
+- **Location:** `src/storage/buffer_pool_manager.cpp` (in `register_load_waiter()`)
+- **Bug:**
+  ```cpp
+  auto& waiters = loading_waiters_[page_id];
+  if (std::find(waiters.begin(), waiters.end(), operation_id) != waiters.end()) {
+      return StorageResult::INVALID_ARGUMENT;
+  }
+  waiters.push_back(operation_id);
+  return StorageResult::SUCCESS;
+  ```
+- **Consequence:** When an operation polls or re-executes `pin_page(page_id, operation_id)` while the page is still in `LOADING` state, `register_load_waiter` treats the already-registered operation as an error and returns `INVALID_ARGUMENT`. The retry fails rather than reporting `LOAD_IN_PROGRESS`.
+- **Fix:** Make `register_load_waiter` idempotent. If `operation_id` is already in `waiters`, return `StorageResult::SUCCESS`:
+  ```cpp
+  auto& waiters = loading_waiters_[page_id];
+  if (std::find(waiters.begin(), waiters.end(), operation_id) == waiters.end()) {
+      waiters.push_back(operation_id);
+  }
+  return StorageResult::SUCCESS;
+  ```
+
+### 5. Specification Gap: `config_.max_pending_loads` Is Never Enforced
+- **Location:** `src/storage/buffer_pool_manager.cpp` (in `begin_page_load()` and `pin_page()`)
+- **Bug:** `BufferPoolConfig::max_pending_loads` is validated in the constructor, but never enforced when allocating a `LOADING` frame.
+- **Consequence:** An operation burst with multiple page faults can transition every single pool frame to `LOADING`, completely bypassing the configured asynchronous I/O concurrency limit.
+- **Fix:** In `begin_page_load()`, before calling `assign_frame(page_id, BufferFrameState::LOADING, out_frame_id)`, enforce:
+  ```cpp
+  if (loading_count() >= config_.max_pending_loads) {
+      return StorageResult::BUSY;
+  }
+  ```
+  This allows callers to suspend and retry rather than saturating host I/O and exhausting frames.

@@ -15,6 +15,7 @@ using frame_id_t = uint32_t;
 using pin_token_t = uint64_t;
 using operation_id_t = uint64_t;
 using flush_batch_id_t = uint64_t;
+using load_id_t = uint64_t;
 
 class BufferPoolManager;
 
@@ -145,6 +146,9 @@ struct FrameDescriptor {
     // Unique identity of the current flush attempt. This distinguishes retries
     // that happen at the same dirty generation.
     flush_batch_id_t flushing_batch_id{0};
+
+    // Unique identity of the current host page-load reservation.
+    load_id_t loading_id{0};
 };
 
 class BufferPoolManager {
@@ -242,12 +246,36 @@ public:
     // The returned frame ID is stable until the page is released. If the page is
     // already loading, LOAD_IN_PROGRESS is returned; duplicate residency is
     // rejected instead of creating a second mutable copy.
-    StorageResult begin_page_load(page_id_t page_id, frame_id_t& out_frame_id);
+    StorageResult begin_page_load(page_id_t page_id,
+                                  frame_id_t& out_frame_id,
+                                  load_id_t& out_load_id);
 
-    // Completes a synchronous/test page load by transitioning LOADING to
-    // RESIDENT. The page bytes are supplied by the minimal test backend in a
-    // later step; this Step 1 operation establishes lifecycle ownership only.
-    StorageResult complete_page_load(page_id_t page_id);
+    // Completes a page load by copying exactly one page into the matching
+    // LOADING frame and returning every operation waiting for that page.
+    StorageResult complete_page_load(page_id_t page_id,
+                                     load_id_t load_id,
+                                     const std::vector<uint8_t>& bytes,
+                                     std::vector<operation_id_t>& out_woken_operations);
+
+    // Supplies exactly one host page to a matching LOADING frame and returns
+    // every operation waiting for that page. The frame owns a copy of bytes.
+    StorageResult provide_page(page_id_t page_id,
+                               load_id_t load_id,
+                               const std::vector<uint8_t>& bytes,
+                               std::vector<operation_id_t>& out_woken_operations);
+
+    // Aborts a matching LOADING frame, returns its waiters, and recycles the
+    // frame as ABSENT so a later request can retry the load.
+    StorageResult abort_page_load(page_id_t page_id,
+                                  load_id_t load_id,
+                                  std::vector<operation_id_t>& out_failed_operations);
+
+    // Returns the token for the active load reservation of page_id.
+    std::optional<load_id_t> get_page_load_id(page_id_t page_id) const noexcept;
+
+    // Returns every page currently reserved in a LOADING frame, including
+    // loads whose waiters were cancelled but whose host request is still open.
+    std::vector<page_id_t> get_pending_page_ids() const;
 
     // Synchronously assigns an ABSENT frame as a resident page. This models the
     // Step 1 test backend, which has page bytes available immediately and does
@@ -320,6 +348,7 @@ private:
     std::unordered_map<operation_id_t, std::vector<pin_token_t>> operation_pins_;
     pin_token_t next_pin_token_{1};
     flush_batch_id_t next_flush_batch_id_{1};
+    load_id_t next_load_id_{1};
 
     // Operations waiting for a page whose frame is LOADING. The first miss
     // reserves the frame and adds its operation here; later misses join this
@@ -345,12 +374,14 @@ private:
     StorageResult assign_frame(page_id_t page_id,
                                BufferFrameState state,
                                frame_id_t& out_frame_id);
+    bool select_clean_victim(frame_id_t& out_frame_id) noexcept;
     Frame* find_frame(page_id_t page_id) noexcept;
     const Frame* find_frame(page_id_t page_id) const noexcept;
     static bool is_valid_page_id(page_id_t page_id) noexcept;
     StorageResult release_pin_token(pin_token_t pin_token, operation_id_t operation_id) noexcept;
     StorageResult register_load_waiter(page_id_t page_id, operation_id_t operation_id);
     void unregister_load_waiter(page_id_t page_id, operation_id_t operation_id) noexcept;
+    void unregister_operation_load_waiters(operation_id_t operation_id) noexcept;
     void discard_loading_frame(page_id_t page_id) noexcept;
 };
 
