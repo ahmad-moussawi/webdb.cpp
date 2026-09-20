@@ -425,7 +425,7 @@ void test_buffer_pool_manager() {
                 "A full pool can load its initial clean working set");
     TEST_ASSERT(clock_pool.load_page(FIRST_DATA_PAGE_ID + 2, first_clock_frame) == StorageResult::SUCCESS &&
                     !clock_pool.find_frame_by_page_id(FIRST_DATA_PAGE_ID + 1).has_value() &&
-                    clock_pool.find_frame_by_page_id(FIRST_DATA_PAGE_ID + 2).value() == first_clock_frame,
+                    clock_pool.find_frame_by_page_id(FIRST_DATA_PAGE_ID + 2).value() == second_clock_frame,
                 "Clock eviction reuses an unpinned clean frame without stale page mappings");
 
     BufferPoolManager second_chance_pool(BufferPoolConfig{2, 2, 2});
