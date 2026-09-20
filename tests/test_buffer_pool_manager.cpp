@@ -138,8 +138,12 @@ void test_buffer_pool_manager() {
     TEST_ASSERT(raii_dirty_descriptor.has_value() && raii_dirty_descriptor->state == BufferFrameState::DIRTY &&
                     raii_dirty_descriptor->dirty_generation == 1 && pool.get_pin_count(FIRST_DATA_PAGE_ID) == 0,
                 "Releasing a read-write handle marks the page dirty and drops its pin");
-    TEST_ASSERT(pool.begin_page_flush(FIRST_DATA_PAGE_ID) == StorageResult::SUCCESS &&
-                    pool.complete_page_flush(FIRST_DATA_PAGE_ID, true) == StorageResult::SUCCESS,
+    flush_batch_id_t flush_batch = 0;
+    uint64_t flush_generation = 0;
+    TEST_ASSERT(pool.begin_page_flush(FIRST_DATA_PAGE_ID, flush_batch, flush_generation) ==
+                    StorageResult::SUCCESS &&
+                    pool.complete_page_flush(FIRST_DATA_PAGE_ID, flush_batch, flush_generation, true) ==
+                        StorageResult::SUCCESS,
                 "The RAII dirtied page can be flushed before further tests");
 
     {
@@ -158,8 +162,10 @@ void test_buffer_pool_manager() {
                         cleanup_descriptor->dirty_generation == 2,
                     "Bulk operation cleanup preserves write dirtiness");
     }
-    TEST_ASSERT(pool.begin_page_flush(FIRST_DATA_PAGE_ID) == StorageResult::SUCCESS &&
-                    pool.complete_page_flush(FIRST_DATA_PAGE_ID, true) == StorageResult::SUCCESS,
+    TEST_ASSERT(pool.begin_page_flush(FIRST_DATA_PAGE_ID, flush_batch, flush_generation) ==
+                    StorageResult::SUCCESS &&
+                    pool.complete_page_flush(FIRST_DATA_PAGE_ID, flush_batch, flush_generation, true) ==
+                        StorageResult::SUCCESS,
                 "The cleanup-tested page can be flushed");
 
     frame_id_t sequential_frame = 0;
@@ -189,8 +195,10 @@ void test_buffer_pool_manager() {
     TEST_ASSERT(pool.mark_page_dirty(FIRST_DATA_PAGE_ID + 2) == StorageResult::SUCCESS &&
                     pool.get_frame_descriptor(sequential_frame)->dirty_generation == 3,
                 "Explicit dirty marking also advances an existing generation");
-    TEST_ASSERT(pool.begin_page_flush(FIRST_DATA_PAGE_ID + 2) == StorageResult::SUCCESS &&
-                    pool.complete_page_flush(FIRST_DATA_PAGE_ID + 2, true) == StorageResult::SUCCESS,
+    TEST_ASSERT(pool.begin_page_flush(FIRST_DATA_PAGE_ID + 2, flush_batch, flush_generation) ==
+                    StorageResult::SUCCESS &&
+                    pool.complete_page_flush(FIRST_DATA_PAGE_ID + 2, flush_batch, flush_generation, true) ==
+                        StorageResult::SUCCESS,
                 "The sequential-write page can be flushed");
 
     {
@@ -229,23 +237,42 @@ void test_buffer_pool_manager() {
                     dirty_descriptor->dirty_generation == previous_dirty_descriptor->dirty_generation + 1 &&
                     pool.dirty_count() == 1,
                 "Dirty transitions advance the mutation generation");
-    TEST_ASSERT(pool.begin_page_flush(FIRST_DATA_PAGE_ID) == StorageResult::SUCCESS,
+    TEST_ASSERT(pool.begin_page_flush(FIRST_DATA_PAGE_ID, flush_batch, flush_generation) ==
+                    StorageResult::SUCCESS,
                 "An unpinned DIRTY page can enter FLUSHING");
     TEST_ASSERT(pool.flushing_count() == 1 && pool.dirty_count() == 0,
                 "FLUSHING pages leave the DIRTY count while the snapshot is active");
-    TEST_ASSERT(pool.complete_page_flush(FIRST_DATA_PAGE_ID, true) == StorageResult::SUCCESS,
+    TEST_ASSERT(pool.complete_page_flush(FIRST_DATA_PAGE_ID, flush_batch, flush_generation, true) ==
+                    StorageResult::SUCCESS,
                 "A successful flush returns a page to RESIDENT");
     TEST_ASSERT(pool.is_page_resident(FIRST_DATA_PAGE_ID) && pool.flushing_count() == 0,
                 "Successful flush completion clears FLUSHING state");
 
     TEST_ASSERT(pool.mark_page_dirty(FIRST_DATA_PAGE_ID + 1) == StorageResult::SUCCESS &&
-                    pool.begin_page_flush(FIRST_DATA_PAGE_ID + 1) == StorageResult::SUCCESS &&
-                    pool.complete_page_flush(FIRST_DATA_PAGE_ID + 1, false) == StorageResult::SUCCESS,
+                    pool.begin_page_flush(FIRST_DATA_PAGE_ID + 1, flush_batch, flush_generation) ==
+                        StorageResult::SUCCESS &&
+                    pool.complete_page_flush(FIRST_DATA_PAGE_ID + 1, flush_batch, flush_generation, false) ==
+                        StorageResult::SUCCESS,
                 "A failed flush returns the page to DIRTY");
     auto failed_descriptor = pool.get_frame_descriptor(loading_frame);
     TEST_ASSERT(failed_descriptor.has_value() && failed_descriptor->state == BufferFrameState::DIRTY &&
+                    failed_descriptor->flushing_generation == 0 && failed_descriptor->flushing_batch_id == 0 &&
                     pool.dirty_count() == 1,
-                "Failed flushes preserve dirty in-memory state");
+                "Failed flushes preserve dirty state and clear snapshot metadata");
+
+    const flush_batch_id_t failed_batch = flush_batch;
+    const uint64_t failed_generation = flush_generation;
+    TEST_ASSERT(pool.begin_page_flush(FIRST_DATA_PAGE_ID + 1, flush_batch, flush_generation) ==
+                    StorageResult::SUCCESS &&
+                    flush_batch != failed_batch,
+                "A retry receives a distinct batch identity at the same generation");
+    TEST_ASSERT(pool.complete_page_flush(FIRST_DATA_PAGE_ID + 1, failed_batch, failed_generation, true) ==
+                    StorageResult::INVALID_ARGUMENT &&
+                    pool.flushing_count() == 1,
+                "A delayed completion cannot finish a newer flush attempt");
+    TEST_ASSERT(pool.complete_page_flush(FIRST_DATA_PAGE_ID + 1, flush_batch, flush_generation, false) ==
+                    StorageResult::SUCCESS,
+                "The active retry can still complete and preserve dirty state");
 
     TEST_ASSERT(pool.release_page(FIRST_DATA_PAGE_ID) == StorageResult::SUCCESS,
                 "A clean unpinned page can be released");

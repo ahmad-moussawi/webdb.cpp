@@ -14,6 +14,7 @@ namespace webdb {
 using frame_id_t = uint32_t;
 using pin_token_t = uint64_t;
 using operation_id_t = uint64_t;
+using flush_batch_id_t = uint64_t;
 
 class BufferPoolManager;
 
@@ -140,6 +141,10 @@ struct FrameDescriptor {
     // completion is accepted only when its batch and generation still match this
     // frame's active snapshot.
     uint64_t flushing_generation{0};
+
+    // Unique identity of the current flush attempt. This distinguishes retries
+    // that happen at the same dirty generation.
+    flush_batch_id_t flushing_batch_id{0};
 };
 
 class BufferPoolManager {
@@ -254,12 +259,19 @@ public:
     // this lifecycle transition.
     StorageResult mark_page_dirty(page_id_t page_id);
 
-    // Moves an unpinned dirty page into FLUSHING for a host-write simulation.
-    StorageResult begin_page_flush(page_id_t page_id);
+    // Moves an unpinned dirty page into FLUSHING and returns the immutable
+    // batch/generation snapshot that the host must echo on completion.
+    StorageResult begin_page_flush(page_id_t page_id,
+                                   flush_batch_id_t& out_batch_id,
+                                   uint64_t& out_generation);
 
-    // Completes a simulated flush. Success returns the page to RESIDENT; failure
-    // preserves the page in DIRTY so its in-memory mutation cannot be lost.
-    StorageResult complete_page_flush(page_id_t page_id, bool success);
+    // Completes a simulated flush only when its batch and generation still match
+    // the active snapshot. Success returns the page to RESIDENT; failure
+    // preserves the page in DIRTY and clears the snapshot metadata.
+    StorageResult complete_page_flush(page_id_t page_id,
+                                      flush_batch_id_t batch_id,
+                                      uint64_t generation,
+                                      bool success);
 
     // Releases an unpinned resident page mapping and returns its frame to the
     // ABSENT free list. Loading, dirty, or flushing pages cannot be discarded by
@@ -307,6 +319,7 @@ private:
     std::unordered_map<pin_token_t, PinRecord> pins_;
     std::unordered_map<operation_id_t, std::vector<pin_token_t>> operation_pins_;
     pin_token_t next_pin_token_{1};
+    flush_batch_id_t next_flush_batch_id_{1};
 
     // Operations waiting for a page whose frame is LOADING. The first miss
     // reserves the frame and adds its operation here; later misses join this

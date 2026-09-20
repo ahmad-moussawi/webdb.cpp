@@ -14,31 +14,28 @@ bool is_resident_state(BufferFrameState state) noexcept {
            state == BufferFrameState::FLUSHING;
 }
 
-} // namespace
+}  // namespace
 
-PageHandle::PageHandle(BufferPoolManager* manager,
-                       page_id_t page_id,
-                       frame_id_t frame_id,
-                       pin_token_t pin_token,
-                       operation_id_t operation_id,
-                       AccessMode access_mode,
-                       uint8_t* bytes) noexcept
+PageHandle::PageHandle(BufferPoolManager* manager, page_id_t page_id, frame_id_t frame_id, pin_token_t pin_token,
+                       operation_id_t operation_id, AccessMode access_mode, uint8_t* bytes) noexcept
     : manager_(manager),
       page_id_(page_id),
       frame_id_(frame_id),
       pin_token_(pin_token),
-    operation_id_(operation_id),
+      operation_id_(operation_id),
       access_mode_(access_mode),
       bytes_(bytes) {}
 
-PageHandle::~PageHandle() noexcept { reset(); }
+PageHandle::~PageHandle() noexcept {
+    reset();
+}
 
 PageHandle::PageHandle(PageHandle&& other) noexcept
     : manager_(other.manager_),
       page_id_(other.page_id_),
       frame_id_(other.frame_id_),
       pin_token_(other.pin_token_),
-    operation_id_(other.operation_id_),
+      operation_id_(other.operation_id_),
       access_mode_(other.access_mode_),
       bytes_(other.bytes_) {
     other.manager_ = nullptr;
@@ -48,14 +45,21 @@ PageHandle::PageHandle(PageHandle&& other) noexcept
     other.pin_token_ = 0;
     other.operation_id_ = 0;
     other.access_mode_ = AccessMode::READ_ONLY;
+
     if (manager_ != nullptr) {
         const auto pin_it = manager_->pins_.find(pin_token_);
-        if (pin_it != manager_->pins_.end()) pin_it->second.handle = this;
+
+        if (pin_it != manager_->pins_.end()) {
+            pin_it->second.handle = this;
+        }
     }
 }
 
 PageHandle& PageHandle::operator=(PageHandle&& other) noexcept {
-    if (this == &other) return *this;
+    if (this == &other) {
+        return *this;
+    }
+
     reset();
     manager_ = other.manager_;
     page_id_ = other.page_id_;
@@ -71,21 +75,28 @@ PageHandle& PageHandle::operator=(PageHandle&& other) noexcept {
     other.pin_token_ = 0;
     other.operation_id_ = 0;
     other.access_mode_ = AccessMode::READ_ONLY;
+
     if (manager_ != nullptr) {
         const auto pin_it = manager_->pins_.find(pin_token_);
         if (pin_it != manager_->pins_.end()) pin_it->second.handle = this;
     }
+
     return *this;
 }
 
-const uint8_t* PageHandle::data() const noexcept { return bytes_; }
+const uint8_t* PageHandle::data() const noexcept {
+    return bytes_;
+}
 
 uint8_t* PageHandle::mutable_data() noexcept {
     return access_mode_ == AccessMode::READ_WRITE ? bytes_ : nullptr;
 }
 
 void PageHandle::reset() noexcept {
-    if (manager_ != nullptr) manager_->release_pin_token(pin_token_, operation_id_);
+    if (manager_ != nullptr) {
+        manager_->release_pin_token(pin_token_, operation_id_);
+    }
+
     manager_ = nullptr;
     page_id_ = INVALID_PAGE_ID;
     frame_id_ = 0;
@@ -106,13 +117,14 @@ void PageHandle::invalidate_from_manager() noexcept {
 }
 
 BufferPoolManager::BufferPoolManager(BufferPoolConfig config) : config_(config) {
-    if (config_.frame_count == 0 || config_.frame_count > MAX_FRAME_COUNT ||
-        config_.max_pending_loads == 0 || config_.max_pending_loads > config_.frame_count ||
-        config_.max_flush_batch_pages == 0 || config_.max_flush_batch_pages > config_.frame_count) {
+    if (config_.frame_count == 0 || config_.frame_count > MAX_FRAME_COUNT || config_.max_pending_loads == 0 ||
+        config_.max_pending_loads > config_.frame_count || config_.max_flush_batch_pages == 0 ||
+        config_.max_flush_batch_pages > config_.frame_count) {
         throw std::invalid_argument("Buffer pool configuration is outside the supported range");
     }
 
     const auto frame_count = static_cast<size_t>(config_.frame_count);
+
     if (frame_count > std::numeric_limits<size_t>::max() / DATABASE_PAGE_SIZE) {
         throw std::invalid_argument("Buffer pool storage size overflows size_t");
     }
@@ -130,7 +142,9 @@ BufferPoolManager::BufferPoolManager(BufferPoolConfig config) : config_(config) 
 
 BufferPoolManager::~BufferPoolManager() = default;
 
-size_t BufferPoolManager::frame_count() const noexcept { return frames_.size(); }
+size_t BufferPoolManager::frame_count() const noexcept {
+    return frames_.size();
+}
 
 size_t BufferPoolManager::resident_count() const noexcept {
     size_t count = 0;
@@ -164,9 +178,13 @@ size_t BufferPoolManager::flushing_count() const noexcept {
     return count;
 }
 
-size_t BufferPoolManager::free_frame_count() const noexcept { return free_frames_.size(); }
+size_t BufferPoolManager::free_frame_count() const noexcept {
+    return free_frames_.size();
+}
 
-frame_id_t BufferPoolManager::get_clock_hand() const noexcept { return clock_hand_; }
+frame_id_t BufferPoolManager::get_clock_hand() const noexcept {
+    return clock_hand_;
+}
 
 std::optional<frame_id_t> BufferPoolManager::find_frame_by_page_id(page_id_t page_id) const noexcept {
     const auto it = page_to_frame_.find(page_id);
@@ -194,10 +212,8 @@ uint32_t BufferPoolManager::get_pin_count(page_id_t page_id) const noexcept {
     return frame_id.has_value() ? frames_[*frame_id].descriptor.pin_count : 0;
 }
 
-StorageResult BufferPoolManager::pin_page(page_id_t page_id,
-                                           operation_id_t operation_id,
-                                           AccessMode access_mode,
-                                           PageHandle& out_handle) {
+StorageResult BufferPoolManager::pin_page(page_id_t page_id, operation_id_t operation_id, AccessMode access_mode,
+                                          PageHandle& out_handle) {
     if (!is_valid_page_id(page_id) || operation_id == 0) {
         return StorageResult::INVALID_ARGUMENT;
     }
@@ -235,12 +251,7 @@ StorageResult BufferPoolManager::pin_page(page_id_t page_id,
     }
 
     const pin_token_t token = next_pin_token_++;
-    const auto insertion = pins_.emplace(token, PinRecord{
-        operation_id,
-        page_id,
-        *frame_id,
-        access_mode
-    });
+    const auto insertion = pins_.emplace(token, PinRecord{operation_id, page_id, *frame_id, access_mode});
 
     if (!insertion.second) {
         return StorageResult::INVALID_ARGUMENT;
@@ -255,16 +266,13 @@ StorageResult BufferPoolManager::pin_page(page_id_t page_id,
 
     ++descriptor.pin_count;
     descriptor.ref_bit = true;
-    out_handle = PageHandle(this, page_id, *frame_id, token, operation_id, access_mode,
-                            get_frame_bytes(*frame_id));
+    out_handle = PageHandle(this, page_id, *frame_id, token, operation_id, access_mode, get_frame_bytes(*frame_id));
     pins_.find(token)->second.handle = &out_handle;
 
     return StorageResult::SUCCESS;
 }
 
-StorageResult BufferPoolManager::unpin_page(pin_token_t pin_token,
-                                            operation_id_t operation_id,
-                                            bool is_dirty) {
+StorageResult BufferPoolManager::unpin_page(pin_token_t pin_token, operation_id_t operation_id, bool is_dirty) {
     const auto pin_it = pins_.find(pin_token);
     if (pin_it == pins_.end() || pin_it->second.operation_id != operation_id) {
         return StorageResult::INVALID_ARGUMENT;
@@ -275,8 +283,7 @@ StorageResult BufferPoolManager::unpin_page(pin_token_t pin_token,
     return release_pin_token(pin_token, operation_id);
 }
 
-StorageResult BufferPoolManager::mark_page_dirty(pin_token_t pin_token,
-                                                  operation_id_t operation_id) {
+StorageResult BufferPoolManager::mark_page_dirty(pin_token_t pin_token, operation_id_t operation_id) {
     const auto pin_it = pins_.find(pin_token);
     if (pin_it == pins_.end() || pin_it->second.operation_id != operation_id) {
         return StorageResult::INVALID_ARGUMENT;
@@ -325,8 +332,7 @@ bool BufferPoolManager::is_valid_page_id(page_id_t page_id) noexcept {
     return page_id >= 0 && page_id <= MAX_DATA_PAGE_ID;
 }
 
-StorageResult BufferPoolManager::register_load_waiter(page_id_t page_id,
-                                                       operation_id_t operation_id) {
+StorageResult BufferPoolManager::register_load_waiter(page_id_t page_id, operation_id_t operation_id) {
     auto& waiters = loading_waiters_[page_id];
     if (std::find(waiters.begin(), waiters.end(), operation_id) != waiters.end()) {
         return StorageResult::INVALID_ARGUMENT;
@@ -335,8 +341,7 @@ StorageResult BufferPoolManager::register_load_waiter(page_id_t page_id,
     return StorageResult::SUCCESS;
 }
 
-void BufferPoolManager::unregister_load_waiter(page_id_t page_id,
-                                               operation_id_t operation_id) noexcept {
+void BufferPoolManager::unregister_load_waiter(page_id_t page_id, operation_id_t operation_id) noexcept {
     const auto waiter_it = loading_waiters_.find(page_id);
     if (waiter_it == loading_waiters_.end()) return;
     auto& waiters = waiter_it->second;
@@ -356,8 +361,7 @@ void BufferPoolManager::discard_loading_frame(page_id_t page_id) noexcept {
     free_frames_.push_back(*frame_id);
 }
 
-StorageResult BufferPoolManager::release_pin_token(pin_token_t pin_token,
-                                                   operation_id_t operation_id) noexcept {
+StorageResult BufferPoolManager::release_pin_token(pin_token_t pin_token, operation_id_t operation_id) noexcept {
     const auto pin_it = pins_.find(pin_token);
 
     if (pin_it == pins_.end()) {
@@ -422,11 +426,8 @@ const BufferPoolManager::Frame* BufferPoolManager::find_frame(page_id_t page_id)
 // flush-generation invariants cannot be bypassed by a caller assigning a frame
 // directly. Duplicate page IDs are rejected before the free list is changed,
 // and a full free list returns BUFFER_FULL without modifying the frame table.
-StorageResult BufferPoolManager::assign_frame(page_id_t page_id,
-                                               BufferFrameState state,
-                                               frame_id_t& out_frame_id) {
-    if (!is_valid_page_id(page_id) || (state != BufferFrameState::LOADING &&
-                                       state != BufferFrameState::RESIDENT)) {
+StorageResult BufferPoolManager::assign_frame(page_id_t page_id, BufferFrameState state, frame_id_t& out_frame_id) {
+    if (!is_valid_page_id(page_id) || (state != BufferFrameState::LOADING && state != BufferFrameState::RESIDENT)) {
         return StorageResult::INVALID_ARGUMENT;
     }
     if (page_to_frame_.find(page_id) != page_to_frame_.end()) {
@@ -461,7 +462,7 @@ StorageResult BufferPoolManager::begin_page_load(page_id_t page_id, frame_id_t& 
             return StorageResult::LOAD_IN_PROGRESS;
         }
         return existing->descriptor.state == BufferFrameState::FLUSHING ? StorageResult::BUSY
-                                                                          : StorageResult::INVALID_ARGUMENT;
+                                                                        : StorageResult::INVALID_ARGUMENT;
     }
     return assign_frame(page_id, BufferFrameState::LOADING, out_frame_id);
 }
@@ -480,8 +481,8 @@ StorageResult BufferPoolManager::load_page(page_id_t page_id, frame_id_t& out_fr
 
 StorageResult BufferPoolManager::mark_page_dirty(page_id_t page_id) {
     Frame* frame = find_frame(page_id);
-    if (frame == nullptr || (frame->descriptor.state != BufferFrameState::RESIDENT &&
-                             frame->descriptor.state != BufferFrameState::DIRTY)) {
+    if (frame == nullptr ||
+        (frame->descriptor.state != BufferFrameState::RESIDENT && frame->descriptor.state != BufferFrameState::DIRTY)) {
         return StorageResult::INVALID_ARGUMENT;
     }
     frame->descriptor.state = BufferFrameState::DIRTY;
@@ -490,40 +491,64 @@ StorageResult BufferPoolManager::mark_page_dirty(page_id_t page_id) {
     return StorageResult::SUCCESS;
 }
 
-StorageResult BufferPoolManager::begin_page_flush(page_id_t page_id) {
+StorageResult BufferPoolManager::begin_page_flush(page_id_t page_id, flush_batch_id_t& out_batch_id,
+                                                  uint64_t& out_generation) {
     Frame* frame = find_frame(page_id);
-    if (frame == nullptr || frame->descriptor.state != BufferFrameState::DIRTY ||
-        frame->descriptor.pin_count != 0) {
+
+    if (frame == nullptr || frame->descriptor.state != BufferFrameState::DIRTY || frame->descriptor.pin_count != 0) {
         return StorageResult::INVALID_ARGUMENT;
     }
+
     frame->descriptor.state = BufferFrameState::FLUSHING;
     frame->descriptor.flushing_generation = frame->descriptor.dirty_generation;
+    frame->descriptor.flushing_batch_id = next_flush_batch_id_++;
+
+    if (next_flush_batch_id_ == 0) {
+        next_flush_batch_id_ = 1;
+    }
+
+    out_batch_id = frame->descriptor.flushing_batch_id;
+    out_generation = frame->descriptor.flushing_generation;
+
     return StorageResult::SUCCESS;
 }
 
-StorageResult BufferPoolManager::complete_page_flush(page_id_t page_id, bool success) {
+StorageResult BufferPoolManager::complete_page_flush(page_id_t page_id, flush_batch_id_t batch_id, uint64_t generation,
+                                                     bool success) {
     Frame* frame = find_frame(page_id);
-    if (frame == nullptr || frame->descriptor.state != BufferFrameState::FLUSHING) {
+
+    if (frame == nullptr || frame->descriptor.state != BufferFrameState::FLUSHING ||
+        frame->descriptor.flushing_batch_id != batch_id || frame->descriptor.flushing_generation != generation) {
         return StorageResult::INVALID_ARGUMENT;
     }
+
     frame->descriptor.state = success ? BufferFrameState::RESIDENT : BufferFrameState::DIRTY;
-    if (success) frame->descriptor.flushing_generation = 0;
+    frame->descriptor.flushing_generation = 0;
+    frame->descriptor.flushing_batch_id = 0;
+
     return StorageResult::SUCCESS;
 }
 
 StorageResult BufferPoolManager::release_page(page_id_t page_id) {
     const auto frame_id = find_frame_by_page_id(page_id);
-    if (!frame_id.has_value()) return StorageResult::INVALID_ARGUMENT;
+
+    if (!frame_id.has_value()) {
+        return StorageResult::INVALID_ARGUMENT;
+    }
+
     FrameDescriptor& descriptor = frames_[*frame_id].descriptor;
+
     if (descriptor.pin_count != 0 || descriptor.state == BufferFrameState::LOADING ||
         descriptor.state == BufferFrameState::DIRTY || descriptor.state == BufferFrameState::FLUSHING) {
         return StorageResult::INVALID_ARGUMENT;
     }
+
     page_to_frame_.erase(page_id);
     descriptor = FrameDescriptor{};
     descriptor.frame_id = *frame_id;
     free_frames_.push_back(*frame_id);
+
     return StorageResult::SUCCESS;
 }
 
-} // namespace webdb
+}  // namespace webdb
