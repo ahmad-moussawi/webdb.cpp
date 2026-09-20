@@ -221,7 +221,8 @@ StorageResult BufferPoolManager::pin_page(page_id_t page_id, operation_id_t oper
     const auto frame_id = find_frame_by_page_id(page_id);
     if (!frame_id.has_value()) {
         frame_id_t loading_frame = 0;
-        const StorageResult load_result = begin_page_load(page_id, loading_frame);
+        load_id_t load_id = 0;
+        const StorageResult load_result = begin_page_load(page_id, loading_frame, load_id);
         if (load_result != StorageResult::SUCCESS) return load_result;
         try {
             const StorageResult waiter_result = register_load_waiter(page_id, operation_id);
@@ -530,15 +531,20 @@ StorageResult BufferPoolManager::assign_frame(page_id_t page_id, BufferFrameStat
     descriptor.dirty_generation = 0;
     descriptor.flushing_generation = 0;
     descriptor.flushing_batch_id = 0;
+    descriptor.loading_id = 0;
     out_frame_id = frame_id;
     return StorageResult::SUCCESS;
 }
 
-StorageResult BufferPoolManager::begin_page_load(page_id_t page_id, frame_id_t& out_frame_id) {
+StorageResult BufferPoolManager::begin_page_load(page_id_t page_id,
+                                                 frame_id_t& out_frame_id,
+                                                 load_id_t& out_load_id) {
     if (!is_valid_page_id(page_id)) return StorageResult::INVALID_ARGUMENT;
     const Frame* existing = find_frame(page_id);
     if (existing != nullptr) {
         if (existing->descriptor.state == BufferFrameState::LOADING) {
+            out_frame_id = existing->descriptor.frame_id;
+            out_load_id = existing->descriptor.loading_id;
             return StorageResult::LOAD_IN_PROGRESS;
         }
 
@@ -550,23 +556,32 @@ StorageResult BufferPoolManager::begin_page_load(page_id_t page_id, frame_id_t& 
         return StorageResult::BUSY;
     }
 
-    return assign_frame(page_id, BufferFrameState::LOADING, out_frame_id);
+    const StorageResult result = assign_frame(page_id, BufferFrameState::LOADING, out_frame_id);
+    if (result != StorageResult::SUCCESS) return result;
+    FrameDescriptor& descriptor = frames_[out_frame_id].descriptor;
+    descriptor.loading_id = next_load_id_++;
+    if (next_load_id_ == 0) next_load_id_ = 1;
+    out_load_id = descriptor.loading_id;
+    return StorageResult::SUCCESS;
 }
 
-StorageResult BufferPoolManager::complete_page_load(page_id_t page_id, const std::vector<uint8_t>& bytes,
+StorageResult BufferPoolManager::complete_page_load(page_id_t page_id, load_id_t load_id,
+                                                    const std::vector<uint8_t>& bytes,
                                                     std::vector<operation_id_t>& out_woken_operations) {
-    return provide_page(page_id, bytes, out_woken_operations);
+    return provide_page(page_id, load_id, bytes, out_woken_operations);
 }
 
-StorageResult BufferPoolManager::provide_page(page_id_t page_id, const std::vector<uint8_t>& bytes,
+StorageResult BufferPoolManager::provide_page(page_id_t page_id, load_id_t load_id,
+                                              const std::vector<uint8_t>& bytes,
                                               std::vector<operation_id_t>& out_woken_operations) {
-    if (!is_valid_page_id(page_id) || bytes.size() != DATABASE_PAGE_SIZE) {
+    if (!is_valid_page_id(page_id) || load_id == 0 || bytes.size() != DATABASE_PAGE_SIZE) {
         return StorageResult::INVALID_ARGUMENT;
     }
 
     Frame* frame = find_frame(page_id);
 
-    if (frame == nullptr || frame->descriptor.state != BufferFrameState::LOADING) {
+    if (frame == nullptr || frame->descriptor.state != BufferFrameState::LOADING ||
+        frame->descriptor.loading_id != load_id) {
         return StorageResult::INVALID_ARGUMENT;
     }
 
@@ -586,8 +601,9 @@ StorageResult BufferPoolManager::provide_page(page_id_t page_id, const std::vect
 }
 
 StorageResult BufferPoolManager::abort_page_load(page_id_t page_id,
+                                                 load_id_t load_id,
                                                  std::vector<operation_id_t>& out_failed_operations) {
-    if (!is_valid_page_id(page_id)) {
+    if (!is_valid_page_id(page_id) || load_id == 0) {
         return StorageResult::INVALID_ARGUMENT;
     }
 
@@ -599,7 +615,8 @@ StorageResult BufferPoolManager::abort_page_load(page_id_t page_id,
 
     FrameDescriptor& descriptor = frames_[*frame_id].descriptor;
 
-    if (descriptor.state != BufferFrameState::LOADING || descriptor.pin_count != 0) {
+    if (descriptor.state != BufferFrameState::LOADING || descriptor.pin_count != 0 ||
+        descriptor.loading_id != load_id) {
         return StorageResult::INVALID_ARGUMENT;
     }
 
@@ -618,6 +635,14 @@ StorageResult BufferPoolManager::abort_page_load(page_id_t page_id,
     free_frames_.push_back(*frame_id);
 
     return StorageResult::SUCCESS;
+}
+
+std::optional<load_id_t> BufferPoolManager::get_page_load_id(page_id_t page_id) const noexcept {
+    const auto frame_id = find_frame_by_page_id(page_id);
+    if (!frame_id.has_value() || frames_[*frame_id].descriptor.state != BufferFrameState::LOADING) {
+        return std::nullopt;
+    }
+    return frames_[*frame_id].descriptor.loading_id;
 }
 
 std::vector<page_id_t> BufferPoolManager::get_pending_page_ids() const {
