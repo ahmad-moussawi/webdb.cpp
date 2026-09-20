@@ -13,6 +13,7 @@ class SchedulerMock implements SchedulerBridge {
   private flushCompleted = false;
   public invalidDirtyPage = false;
   public emptyDirtyPageIds = false;
+  public batchedRead = false;
   public providedPages = 0;
   public flushes: boolean[] = [];
 
@@ -32,17 +33,20 @@ class SchedulerMock implements SchedulerBridge {
   }
 
   getPendingPageIds(_operationId: string): readonly number[] {
-    return this.status === SchedulerStatus.PageFault ? [2] : [];
+    return this.status === SchedulerStatus.PageFault ? (this.batchedRead ? [2, 3] : [2]) : [];
   }
 
   providePage(_operationId: string, pageId: number, bytes: Uint8Array): StorageResult {
-    if (this.status !== SchedulerStatus.PageFault || pageId !== 2 || bytes.byteLength !== DATABASE_PAGE_SIZE) {
+    if (this.status !== SchedulerStatus.PageFault ||
+      (!this.batchedRead && pageId !== 2) ||
+      (this.batchedRead && pageId !== 2 && pageId !== 3) ||
+      bytes.byteLength !== DATABASE_PAGE_SIZE) {
       return StorageResult.InvalidArgument;
     }
     this.page.set(bytes);
     this.page[8] = 99;
     this.providedPages += 1;
-    this.status = SchedulerStatus.Flushing;
+    if (!this.batchedRead || pageId === 3) this.status = SchedulerStatus.Flushing;
     return StorageResult.Success;
   }
 
@@ -176,6 +180,21 @@ test("coordinator does not acknowledge an empty dirty snapshot", async () => {
   assert.equal(outcome.status, SchedulerStatus.Error);
   assert.equal(writeCalls, 0);
   assert.deepEqual(scheduler.flushes, []);
+  assert.equal(scheduler.isReleased, true);
+});
+
+test("coordinator validates every page before supplying a read batch", async () => {
+  const scheduler = new SchedulerMock();
+  scheduler.batchedRead = true;
+  const suppliedStore = {
+    readPages: async () => new Map([[2, new Uint8Array(DATABASE_PAGE_SIZE)]]),
+    writePages: async () => assert.fail("An incomplete read batch must not reach flush"),
+  };
+
+  const outcome = await runOperation(scheduler, suppliedStore, "{}");
+
+  assert.equal(outcome.status, SchedulerStatus.Error);
+  assert.equal(scheduler.providedPages, 0);
   assert.equal(scheduler.isReleased, true);
 });
 

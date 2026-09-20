@@ -763,3 +763,173 @@ During the revalidation of the latest implementation on branch `phase3_clock_evi
   }
   ```
   This allows callers to suspend and retry rather than saturating host I/O and exhausting frames.
+
+---
+
+## Step 5 and Step 6 Implementation Review (Dirty Tracking, Flush Snapshots, & Scheduler Migration)
+
+A thorough review of the Step 5 and Step 6 changes across `src/include/storage/buffer_pool_manager.hpp`, `src/storage/buffer_pool_manager.cpp`, `src/include/storage/operation_scheduler.hpp`, `src/storage/operation_scheduler.cpp`, `tests/test_buffer_pool_manager.cpp`, `tests/test_operation_scheduler.cpp`, and `web/src/operation-coordinator.ts` shows that the core architecture is sound and tests pass. However, several critical edge cases, resource leaks, and multi-operation starvation hazards must be addressed before committing:
+
+### 1. Critical: Permanent Frame Leak in `BufferPoolManager::new_page()` on Rollback
+- **Location:** `src/storage/buffer_pool_manager.cpp` (in `new_page()`)
+- **Bug:**
+  ```cpp
+  std::fill_n(get_frame_bytes(frame_id), DATABASE_PAGE_SIZE, uint8_t{0});
+  frames_[frame_id].descriptor.state = BufferFrameState::DIRTY;
+  frames_[frame_id].descriptor.dirty_generation = 1;
+  const StorageResult pin_result = pin_page(expected_page_id, operation_id, AccessMode::READ_WRITE, out_handle);
+  if (pin_result != StorageResult::SUCCESS) {
+      release_page(expected_page_id);
+      return pin_result;
+  }
+  ```
+  `release_page()` explicitly rejects frames in `DIRTY` state:
+  ```cpp
+  if (descriptor.pin_count != 0 || descriptor.state == BufferFrameState::LOADING ||
+      descriptor.state == BufferFrameState::DIRTY || descriptor.state == BufferFrameState::FLUSHING) {
+      return StorageResult::INVALID_ARGUMENT;
+  }
+  ```
+- **Consequence:** If `pin_page()` fails (e.g. token counter exhaustion or memory allocation failure during token registration), `release_page(expected_page_id)` returns `INVALID_ARGUMENT` and does nothing. The frame remains permanently mapped in `page_to_frame_` in `DIRTY` state with `pin_count == 0` and no owner. It cannot be evicted, cannot be allocated, and permanently leaks a buffer frame.
+- **Fix:** Restore `descriptor.state = BufferFrameState::RESIDENT;` before calling `release_page(expected_page_id)` during rollback:
+  ```cpp
+  if (pin_result != StorageResult::SUCCESS) {
+      frames_[frame_id].descriptor.state = BufferFrameState::RESIDENT;
+      release_page(expected_page_id);
+      return pin_result;
+  }
+  ```
+
+### 2. Specification Gap: Dirty-Pressure Flush Ignored in `new_page()`
+- **Location:** `src/storage/buffer_pool_manager.cpp` (in `new_page()`)
+- **Bug:** In `begin_page_load()`, when `assign_frame()` returns `BUFFER_FULL`, the manager checks for dirty pressure:
+  ```cpp
+  if (result == StorageResult::BUFFER_FULL) {
+      if (active_flush_batch_.has_value()) return StorageResult::BUSY;
+      const FlushBatch batch = get_active_flush_batch();
+      if (batch.batch_id != 0) return StorageResult::FLUSH_REQUIRED;
+  }
+  ```
+  In `new_page()`, when `assign_frame()` returns `BUFFER_FULL`, it returns `BUFFER_FULL` immediately without checking for dirty pressure.
+- **Consequence:** If the pool's frames are filled with unpinned dirty pages, calling `new_page()` immediately fails with `BUFFER_FULL` instead of requesting a flush (`FLUSH_REQUIRED`) to free up clean evictable frames.
+- **Fix:** Add the dirty-pressure check to `new_page()`:
+  ```cpp
+  const StorageResult assign_result = assign_frame(expected_page_id, BufferFrameState::RESIDENT, frame_id);
+  if (assign_result == StorageResult::BUFFER_FULL) {
+      if (active_flush_batch_.has_value()) return StorageResult::BUSY;
+      const FlushBatch batch = get_active_flush_batch();
+      if (batch.batch_id != 0) return StorageResult::FLUSH_REQUIRED;
+  }
+  if (assign_result != StorageResult::SUCCESS) return assign_result;
+  ```
+
+### 3. Critical: Deadlock & Batch Leak in `OperationScheduler::fail_operation()` During Active Flush
+- **Location:** `src/storage/operation_scheduler.cpp` (in `fail_operation()`)
+- **Bug:**
+  ```cpp
+  StorageResult OperationScheduler::fail_operation(operation_id_t operation_id, std::string_view message) noexcept {
+      Operation* operation = find_operation(operation_id);
+      if (!operation || operation->status == SchedulerStatus::COMPLETE ||
+          operation->status == SchedulerStatus::CANCELLED || operation->status == SchedulerStatus::ERROR) {
+          return StorageResult::INVALID_ARGUMENT;
+      }
+      try {
+          operation->error = message;
+          operation->status = SchedulerStatus::ERROR;
+          return StorageResult::SUCCESS;
+      ...
+  ```
+- **Consequence:** If an operation that owns the active flush (`flush_owner_ == operation_id`) fails (e.g. the TypeScript coordinator catches a host write error and calls `failOperation()`), `fail_operation()` transitions the operation to `ERROR` without aborting the active flush batch in `BufferPoolManager`. The active flush batch remains set indefinitely in `buffer_pool_.active_flush_batch_`. All future operations attempting to flush or allocate under dirty pressure will receive `StorageResult::BUSY` indefinitely, causing a permanent pool deadlock. Furthermore, `flush_owner_` is never reset.
+- **Fix:** Mirror the cleanup in `cancel_operation()` by checking if the failing operation is `flush_owner_`, aborting the flush batch via `finish_page_flush(..., false)`, clearing `flush_owner_ = 0`, and releasing pins:
+  ```cpp
+  if (flush_owner_ == operation_id) {
+      const FlushBatch batch = buffer_pool_.get_active_flush_batch();
+      if (batch.batch_id != 0 && !batch.pages.empty()) {
+          buffer_pool_.finish_page_flush(batch.batch_id, batch.pages.front().page_id,
+                                         batch.pages.front().generation, false);
+      }
+      flush_owner_ = 0;
+  }
+  buffer_pool_.release_operation_pins(operation_id);
+  operation->pinned_pages.clear();
+  ```
+
+### 4. Logic Bug: Loop in `OperationScheduler::step_operation()` on `FLUSH_REQUIRED` / `BUSY`
+- **Location:** `src/storage/operation_scheduler.cpp` (in `step_operation()`)
+- **Bug:**
+  ```cpp
+  while (operation->next_read_index < operation->read_page_ids.size()) {
+      const page_id_t page_id = operation->read_page_ids[operation->next_read_index];
+      if (operation->pinned_pages.find(page_id) == operation->pinned_pages.end()) {
+          const bool is_write = ...;
+          const StorageResult request_result = request_page(operation_id, page_id, is_write);
+          if (request_result != StorageResult::SUCCESS) return operation->status;
+          if (operation->status == SchedulerStatus::PAGE_FAULT) return operation->status;
+          continue;
+      }
+      ++operation->next_read_index;
+  }
+  ```
+- **Consequence:** When `request_page()` encounters dirty pressure (`FLUSH_REQUIRED` or `BUSY`), it returns `StorageResult::SUCCESS` and sets `operation->status = SchedulerStatus::FLUSHING`. Because the exit condition only checks `if (operation->status == SchedulerStatus::PAGE_FAULT)`, the loop does not exit! It executes `continue;` and calls `request_page()` again on the next iteration while `operation->status` is `FLUSHING`. `request_page()` rejects non-READY operations with `INVALID_ARGUMENT`, and only then does the function exit.
+- **Fix:** Exit immediately whenever the status is no longer `READY`:
+  ```cpp
+  if (operation->status != SchedulerStatus::READY) return operation->status;
+  ```
+
+### 5. Architectural Hazard: Multi-Operation Flush Starvation & Empty Snapshot Failure
+- **Location:** `src/storage/operation_scheduler.cpp` (in `get_dirty_page_ids()` and `finish_flush()`) and `web/src/operation-coordinator.ts`
+- **Issue:**
+  1. `buffer_pool_.get_active_flush_batch()` snapshots *all* unpinned dirty pages across the entire pool into a single batch owned by `flush_owner_`.
+  2. If Operation 1 flushes, its batch may include dirty pages written by concurrent Operation 2.
+  3. When Operation 1 finishes the flush via `finish_flush(op1, true)`, all dirty pages are cleared, `active_flush_batch_` is reset, and `flush_owner_` is cleared to 0.
+  4. Operation 2 (which entered `FLUSHING`) then calls `get_dirty_page_ids(op2)`. Because all dirty pages were already flushed by Operation 1, `get_active_flush_batch()` returns an empty batch (`pages.empty()`), returning an empty vector `{}`.
+  5. In `web/src/operation-coordinator.ts:68`:
+     ```typescript
+     if (dirtyPageIds.length === 0) {
+       scheduler.failOperation(operationId, "Scheduler returned an empty dirty-page snapshot.");
+     ...
+     ```
+     Operation 2 is failed as an error even though its writes were successfully committed to disk!
+  6. Furthermore, any operations that entered `FLUSHING` due to `BUSY` are never resumed when Operation 1 completes its batch.
+- **Fix:**
+  - In `finish_flush(operation_id, true)`: wake and resume any other operations that were suspended waiting for the flush batch (those with `status == FLUSHING && active_flush_batch_id == 0`) back to `READY`.
+  - In `step_operation()` or `get_dirty_page_ids()`: If an operation in `FLUSHING` has had its writes applied and no dirty pages remain in the pool, advance it directly to `COMPLETE` or allow `finish_flush()` to succeed gracefully without failing when no dirty pages remain.
+
+### 6. Concurrency Edge Case: Idempotent `provide_pages()` for Already-Woken Waiters
+- **Location:** `src/storage/operation_scheduler.cpp` (in `provide_pages()`)
+- **Bug:**
+  ```cpp
+  if (!operation || operation->status != SchedulerStatus::PAGE_FAULT || pages.size() != 1 ||
+      !operation->pending_page_request.has_value()) {
+      return StorageResult::INVALID_ARGUMENT;
+  }
+  ```
+- **Scenario:** When Operation A and Operation B both wait for Page 10, the first supply wakes both and sets both to `SchedulerStatus::READY` with their handles pinned. If Operation B's coordinator had already issued an asynchronous read that now returns, it calls `providePage(opB, 10, bytes)`. Because Operation B is already `READY`, `provide_pages()` returns `INVALID_ARGUMENT`. In `web/src/operation-coordinator.ts:54`, this causes Operation B to fail with `"Host returned an invalid page response."`.
+- **Fix:** Check if the operation is already `READY` and owns a pin on the supplied page, and return `StorageResult::SUCCESS` idempotently:
+  ```cpp
+  if (operation && operation->status == SchedulerStatus::READY &&
+      operation->pinned_pages.find(pages.front().page_id) != operation->pinned_pages.end()) {
+      return StorageResult::SUCCESS;
+  }
+  ```
+
+### 7. Eviction Race: In-Flight Flush Batch Frame Protection
+- **Location:** `src/storage/buffer_pool_manager.cpp` (in `finish_page_flush()` and `select_clean_victim()`)
+- **Subtlety:** When `finish_page_flush(batch_id, page_id, gen, true)` completes for page 1 of an $N$-page batch, that frame transitions to `BufferFrameState::RESIDENT` with `pin_count == 0`. If another operation runs before page 2 completes and causes an eviction, `select_clean_victim()` could select page 1 for eviction. If page 2 subsequently fails, the batch rollback attempts to revert page 1 back to `DIRTY`, but page 1 has already been evicted!
+- **Fix:** In `select_clean_victim()`, protect frames that belong to an in-flight flush batch (`active_flush_batch_.has_value() && completed_flush_pages_.find(descriptor.page_id) != completed_flush_pages_.end()`) until the entire batch has completed or aborted.
+
+## Follow-up Resolution (2026-09-21)
+
+The current implementation was rechecked against the Step 5 and Step 6 plan after the fixes above:
+
+- `new_page()` now checks dirty pressure before returning `BUFFER_FULL` and restores the temporary `RESIDENT` state before rollback, so failed pin registration can release the frame cleanly.
+- `fail_operation()` aborts an owned active flush batch, clears `flush_owner_`, releases pool pins, and prevents a failed host write from permanently blocking later operations.
+- The scheduler exits its page-request loop whenever the operation leaves `READY`, including `PAGE_FAULT`, `FLUSHING`, and `ERROR`; dirty-pressure requests therefore do not re-enter `request_page()` in a loop.
+- Completed pages remain protected while another page in the same flush batch is still in flight. This prevents a later batch failure from trying to roll back an evicted frame.
+- Already-woken operations may acknowledge a duplicate page response idempotently when they already own the pool pin.
+- The coordinator validates every page in a read batch before supplying any page, preventing partial page-load publication.
+
+The following gap remains intentionally open for the next browser-integration slice: Embind and the TypeScript bridge still expose the legacy operation-scoped `providePage(operationId, pageId, bytes)` contract. The pool-level `load_id_t`, `abort_page_load()`, waiter-ID wakeups, and flush batch IDs/generations are implemented natively but are not yet exposed through the WASM adapter. Native Step 5/6 behavior is covered; the WASM protocol migration and browser-level shared-waiter tests remain Step 7 work.
+
+End of review record.
+

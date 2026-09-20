@@ -108,49 +108,77 @@ SchedulerStatus OperationScheduler::step_operation(operation_id_t operation_id) 
         return SchedulerStatus::ERROR;
     }
 
+    if (operation->status == SchedulerStatus::FLUSHING) {
+        if (flush_owner_ == 0) {
+            if (operation->writes_applied && buffer_pool_.dirty_count() == 0) {
+                operation->result = "{}";
+                operation->status = SchedulerStatus::COMPLETE;
+                return operation->status;
+            }
+            if (operation->pending_page_request.has_value()) {
+                operation->status = SchedulerStatus::READY;
+            }
+        }
+    }
+
     if (operation->status == SchedulerStatus::READY) {
         while (operation->next_read_index < operation->read_page_ids.size()) {
             const page_id_t page_id = operation->read_page_ids[operation->next_read_index];
-            if (operation->resident_pages.find(page_id) == operation->resident_pages.end()) {
+            if (operation->pinned_pages.find(page_id) == operation->pinned_pages.end()) {
                 const bool is_write = std::any_of(operation->writes.begin(), operation->writes.end(),
                                                   [page_id](const Operation::Write& write) {
                                                       return write.page_id == page_id;
                                                   });
-                return request_page(operation_id, page_id, is_write) == StorageResult::SUCCESS
-                           ? SchedulerStatus::PAGE_FAULT
-                           : operation->status;
+                const StorageResult request_result = request_page(operation_id, page_id, is_write);
+                if (request_result != StorageResult::SUCCESS) return operation->status;
+                if (operation->status != SchedulerStatus::READY) return operation->status;
+                continue;
             }
             ++operation->next_read_index;
         }
 
         if (!operation->writes_applied) {
             for (const Operation::Write& write : operation->writes) {
-                auto page_it = operation->resident_pages.find(write.page_id);
-                if (page_it == operation->resident_pages.end()) {
+                auto page_it = operation->pinned_pages.find(write.page_id);
+                if (page_it == operation->pinned_pages.end() || page_it->second.mutable_data() == nullptr) {
                     operation->status = SchedulerStatus::ERROR;
-                    operation->error = "A write references a missing resident page.";
+                    operation->error = "A write references a missing or read-only page handle.";
                     return operation->status;
                 }
-                page_it->second[write.byte_offset] = write.value;
+                page_it->second.mutable_data()[write.byte_offset] = write.value;
             }
             operation->writes_applied = true;
 
             if (!operation->writes.empty()) {
+                std::unordered_set<page_id_t> modified_pages;
                 try {
                     for (const Operation::Write& write : operation->writes) {
-                        operation->dirty_pages.emplace(write.page_id, operation->resident_pages.at(write.page_id));
+                        if (modified_pages.insert(write.page_id).second) {
+                            const auto page_it = operation->pinned_pages.find(write.page_id);
+                            if (page_it == operation->pinned_pages.end() ||
+                                buffer_pool_.mark_page_dirty(page_it->second.pin_token(), operation_id) !=
+                                    StorageResult::SUCCESS) {
+                                operation->status = SchedulerStatus::ERROR;
+                                operation->error = "The modified page could not be marked dirty.";
+                                return operation->status;
+                            }
+                        }
                     }
                 } catch (const std::bad_alloc&) {
                     operation->status = SchedulerStatus::ERROR;
-                    operation->error = "Insufficient memory to snapshot dirty pages.";
+                    operation->error = "Insufficient memory to track modified pages.";
                     return operation->status;
                 }
+                buffer_pool_.release_operation_pins(operation_id);
+                operation->pinned_pages.clear();
                 operation->status = SchedulerStatus::FLUSHING;
                 return operation->status;
             }
         }
 
         operation->result = "{}";
+        buffer_pool_.release_operation_pins(operation_id);
+        operation->pinned_pages.clear();
         operation->status = SchedulerStatus::COMPLETE;
     }
     return operation->status;
@@ -163,16 +191,48 @@ StorageResult OperationScheduler::request_page(operation_id_t operation_id,
     if (!operation || operation->status != SchedulerStatus::READY || page_id < FIRST_DATA_PAGE_ID) {
         return StorageResult::INVALID_ARGUMENT;
     }
-    if (operation->resident_pages.find(page_id) != operation->resident_pages.end()) {
+    if (operation->pinned_pages.find(page_id) != operation->pinned_pages.end()) {
         return StorageResult::SUCCESS;
     }
-    if (operation->resident_pages.size() >= MAX_RESIDENT_PAGES_PER_OPERATION) {
+    if (operation->pinned_pages.size() >= MAX_RESIDENT_PAGES_PER_OPERATION) {
         operation->status = SchedulerStatus::ERROR;
         operation->error = "The resident-page limit was reached.";
         return StorageResult::IO_ERROR;
     }
 
-    // Phase 2 intentionally permits one outstanding fault. Later phases may batch requests.
+    PageHandle handle;
+    const StorageResult pin_result = buffer_pool_.pin_page(page_id, operation_id,
+                                                            is_write ? AccessMode::READ_WRITE : AccessMode::READ_ONLY,
+                                                            handle);
+    if (pin_result == StorageResult::SUCCESS) {
+        try {
+            operation->pinned_pages.emplace(page_id, std::move(handle));
+            operation->pending_page_request.reset();
+            ++operation->next_read_index;
+            return StorageResult::SUCCESS;
+        } catch (const std::bad_alloc&) {
+            buffer_pool_.release_operation_pins(operation_id);
+            operation->status = SchedulerStatus::ERROR;
+            operation->error = "Insufficient memory to retain the page handle.";
+            return StorageResult::IO_ERROR;
+        }
+    }
+    if (pin_result == StorageResult::FLUSH_REQUIRED) {
+        operation->pending_page_request = PageRequest{page_id, is_write};
+        operation->active_flush_batch_id = buffer_pool_.get_active_flush_batch().batch_id;
+        flush_owner_ = operation_id;
+        operation->status = SchedulerStatus::FLUSHING;
+        return StorageResult::SUCCESS;
+    }
+    if (pin_result == StorageResult::BUSY) {
+        operation->pending_page_request = PageRequest{page_id, is_write};
+        operation->status = SchedulerStatus::FLUSHING;
+        return StorageResult::SUCCESS;
+    }
+    if (pin_result != StorageResult::PAGE_NOT_RESIDENT && pin_result != StorageResult::LOAD_IN_PROGRESS) {
+        return pin_result;
+    }
+
     operation->pending_page_request = PageRequest{page_id, is_write};
     operation->status = SchedulerStatus::PAGE_FAULT;
     return StorageResult::SUCCESS;
@@ -197,7 +257,16 @@ std::vector<page_id_t> OperationScheduler::get_pending_page_ids(operation_id_t o
 StorageResult OperationScheduler::provide_pages(operation_id_t operation_id,
                                                 const std::vector<PageData>& pages) noexcept {
     Operation* operation = find_operation(operation_id);
-    if (!operation || operation->status != SchedulerStatus::PAGE_FAULT || pages.size() != 1 ||
+    if (!operation || pages.size() != 1) {
+        return StorageResult::INVALID_ARGUMENT;
+    }
+
+    if (operation->status == SchedulerStatus::READY &&
+        operation->pinned_pages.find(pages.front().page_id) != operation->pinned_pages.end()) {
+        return StorageResult::SUCCESS;
+    }
+
+    if (operation->status != SchedulerStatus::PAGE_FAULT ||
         !operation->pending_page_request.has_value()) {
         return StorageResult::INVALID_ARGUMENT;
     }
@@ -208,20 +277,52 @@ StorageResult OperationScheduler::provide_pages(operation_id_t operation_id,
         return StorageResult::INVALID_ARGUMENT;
     }
 
-    try {
-        auto [it, inserted] = operation->resident_pages.emplace(page.page_id, page.bytes);
-        if (!inserted) {
-            return StorageResult::INVALID_ARGUMENT;
-        }
+    const auto load_id = buffer_pool_.get_page_load_id(page.page_id);
+    if (!load_id.has_value()) {
+        PageHandle handle;
+        const StorageResult pin_result = buffer_pool_.pin_page(
+            page.page_id, operation_id, request.is_write ? AccessMode::READ_WRITE : AccessMode::READ_ONLY, handle);
+        if (pin_result != StorageResult::SUCCESS) return StorageResult::INVALID_ARGUMENT;
+        operation->pinned_pages.emplace(page.page_id, std::move(handle));
         operation->pending_page_request.reset();
         ++operation->next_read_index;
         operation->status = SchedulerStatus::READY;
         return StorageResult::SUCCESS;
-    } catch (const std::bad_alloc&) {
-        operation->status = SchedulerStatus::ERROR;
-        operation->error = "Insufficient memory to copy the supplied page.";
-        return StorageResult::IO_ERROR;
     }
+
+    std::vector<operation_id_t> woken_operations;
+    const StorageResult supply_result = buffer_pool_.provide_page(page.page_id, *load_id, page.bytes,
+                                                                   woken_operations);
+    if (supply_result != StorageResult::SUCCESS) return supply_result;
+    for (const operation_id_t woken_id : woken_operations) {
+        Operation* woken = find_operation(woken_id);
+        if (woken == nullptr || woken->status != SchedulerStatus::PAGE_FAULT ||
+            !woken->pending_page_request.has_value() ||
+            woken->pending_page_request->page_id != page.page_id) {
+            continue;
+        }
+        PageHandle handle;
+        const StorageResult pin_result = buffer_pool_.pin_page(
+            page.page_id, woken_id,
+            woken->pending_page_request->is_write ? AccessMode::READ_WRITE : AccessMode::READ_ONLY, handle);
+        if (pin_result != StorageResult::SUCCESS) {
+            woken->status = SchedulerStatus::ERROR;
+            woken->error = "The supplied page could not be pinned after load completion.";
+            continue;
+        }
+        try {
+            woken->pinned_pages.emplace(page.page_id, std::move(handle));
+        } catch (const std::bad_alloc&) {
+            buffer_pool_.release_operation_pins(woken_id);
+            woken->status = SchedulerStatus::ERROR;
+            woken->error = "Insufficient memory to retain the supplied page handle.";
+            continue;
+        }
+        woken->pending_page_request.reset();
+        ++woken->next_read_index;
+        woken->status = SchedulerStatus::READY;
+    }
+    return StorageResult::SUCCESS;
 }
 
 StorageResult OperationScheduler::provide_page(operation_id_t operation_id,
@@ -242,8 +343,9 @@ std::vector<uint8_t> OperationScheduler::copy_resident_page(operation_id_t opera
     if (!operation) {
         return {};
     }
-    auto page_it = operation->resident_pages.find(page_id);
-    return page_it == operation->resident_pages.end() ? std::vector<uint8_t>{} : page_it->second;
+    const auto page_it = operation->pinned_pages.find(page_id);
+    if (page_it == operation->pinned_pages.end() || page_it->second.data() == nullptr) return {};
+    return std::vector<uint8_t>(page_it->second.data(), page_it->second.data() + DATABASE_PAGE_SIZE);
 }
 
 std::vector<PageData> OperationScheduler::get_dirty_pages_for_flush(operation_id_t operation_id) noexcept {
@@ -251,11 +353,15 @@ std::vector<PageData> OperationScheduler::get_dirty_pages_for_flush(operation_id
     if (!operation || operation->status != SchedulerStatus::FLUSHING) {
         return {};
     }
+    if (flush_owner_ != 0 && flush_owner_ != operation_id) return {};
+    const FlushBatch batch = buffer_pool_.get_active_flush_batch();
+    operation->active_flush_batch_id = batch.batch_id;
+    if (batch.batch_id != 0) flush_owner_ = operation_id;
     std::vector<PageData> pages;
     try {
-        pages.reserve(operation->dirty_pages.size());
-        for (const auto& [page_id, bytes] : operation->dirty_pages) {
-            pages.push_back(PageData{page_id, bytes});
+        pages.reserve(batch.pages.size());
+        for (const FlushPage& page : batch.pages) {
+            pages.push_back(PageData{page.page_id, page.bytes});
         }
     } catch (const std::bad_alloc&) {
         operation->status = SchedulerStatus::ERROR;
@@ -274,13 +380,16 @@ std::vector<page_id_t> OperationScheduler::get_dirty_page_ids(operation_id_t ope
     if (!operation || operation->status != SchedulerStatus::FLUSHING) {
         return {};
     }
+    if (flush_owner_ != 0 && flush_owner_ != operation_id) return {};
 
+    const FlushBatch batch = buffer_pool_.get_active_flush_batch();
+    operation->active_flush_batch_id = batch.batch_id;
+    if (batch.batch_id != 0) flush_owner_ = operation_id;
     std::vector<page_id_t> page_ids;
     try {
-        page_ids.reserve(operation->dirty_pages.size());
-        for (const auto& [page_id, bytes] : operation->dirty_pages) {
-            (void)bytes;
-            page_ids.push_back(page_id);
+        page_ids.reserve(batch.pages.size());
+        for (const FlushPage& page : batch.pages) {
+            page_ids.push_back(page.page_id);
         }
     } catch (const std::bad_alloc&) {
         operation->status = SchedulerStatus::ERROR;
@@ -299,8 +408,11 @@ std::vector<uint8_t> OperationScheduler::copy_dirty_page(operation_id_t operatio
     if (!operation || operation->status != SchedulerStatus::FLUSHING) {
         return {};
     }
-    const auto page_it = operation->dirty_pages.find(page_id);
-    return page_it == operation->dirty_pages.end() ? std::vector<uint8_t>{} : page_it->second;
+    if (flush_owner_ != 0 && flush_owner_ != operation_id) return {};
+    const FlushBatch batch = const_cast<BufferPoolManager&>(buffer_pool_).get_active_flush_batch();
+    const auto page_it = std::find_if(batch.pages.begin(), batch.pages.end(),
+                                      [page_id](const FlushPage& page) { return page.page_id == page_id; });
+    return page_it == batch.pages.end() ? std::vector<uint8_t>{} : page_it->bytes;
 }
 
 StorageResult OperationScheduler::finish_flush(operation_id_t operation_id, bool success) noexcept {
@@ -309,12 +421,42 @@ StorageResult OperationScheduler::finish_flush(operation_id_t operation_id, bool
         return StorageResult::INVALID_ARGUMENT;
     }
 
+    const FlushBatch batch = buffer_pool_.get_active_flush_batch();
+    if (batch.batch_id == 0) {
+        return StorageResult::INVALID_ARGUMENT;
+    }
+    if (operation->active_flush_batch_id == 0) operation->active_flush_batch_id = batch.batch_id;
+    if (operation->active_flush_batch_id != batch.batch_id) return StorageResult::INVALID_ARGUMENT;
+    for (const FlushPage& page : batch.pages) {
+        const StorageResult result = buffer_pool_.finish_page_flush(batch.batch_id, page.page_id,
+                                                                     page.generation, success);
+        if (result != StorageResult::SUCCESS) return result;
+        if (!success) break;
+    }
     if (success) {
-        operation->dirty_pages.clear();
+        operation->active_flush_batch_id = 0;
         operation->status = SchedulerStatus::READY;
+        flush_owner_ = 0;
+        for (auto& [id, op] : operations_) {
+            if (op.status == SchedulerStatus::FLUSHING && op.active_flush_batch_id == 0) {
+                if (op.writes_applied && buffer_pool_.dirty_count() == 0) {
+                    op.result = "{}";
+                    op.status = SchedulerStatus::COMPLETE;
+                } else if (op.pending_page_request.has_value()) {
+                    op.status = SchedulerStatus::READY;
+                }
+            }
+        }
     } else {
         operation->status = SchedulerStatus::ERROR;
         operation->error = "The host failed to flush dirty pages.";
+        flush_owner_ = 0;
+        for (auto& [id, op] : operations_) {
+            if (op.status == SchedulerStatus::FLUSHING && op.active_flush_batch_id == 0) {
+                op.status = SchedulerStatus::ERROR;
+                op.error = "The active flush batch failed.";
+            }
+        }
     }
     return StorageResult::SUCCESS;
 }
@@ -325,6 +467,17 @@ StorageResult OperationScheduler::fail_operation(operation_id_t operation_id, st
         operation->status == SchedulerStatus::CANCELLED || operation->status == SchedulerStatus::ERROR) {
         return StorageResult::INVALID_ARGUMENT;
     }
+
+    if (flush_owner_ == operation_id) {
+        const FlushBatch batch = buffer_pool_.get_active_flush_batch();
+        if (batch.batch_id != 0 && !batch.pages.empty()) {
+            buffer_pool_.finish_page_flush(batch.batch_id, batch.pages.front().page_id,
+                                           batch.pages.front().generation, false);
+        }
+        flush_owner_ = 0;
+    }
+    buffer_pool_.release_operation_pins(operation_id);
+    operation->pinned_pages.clear();
 
     try {
         operation->error = message;
@@ -439,6 +592,16 @@ void OperationScheduler::cancel_operation(operation_id_t operation_id) noexcept 
         return;
     }
 
+    if (flush_owner_ == operation_id) {
+        const FlushBatch batch = buffer_pool_.get_active_flush_batch();
+        if (batch.batch_id != 0 && !batch.pages.empty()) {
+            buffer_pool_.finish_page_flush(batch.batch_id, batch.pages.front().page_id,
+                                           batch.pages.front().generation, false);
+        }
+        flush_owner_ = 0;
+    }
+    buffer_pool_.release_operation_pins(operation_id);
+    operation->pinned_pages.clear();
     operation->status = SchedulerStatus::CANCELLED;
     operation->error = "Operation cancelled.";
 }
@@ -451,6 +614,8 @@ StorageResult OperationScheduler::release_operation(operation_id_t operation_id)
         return StorageResult::INVALID_ARGUMENT;
     }
 
+    if (flush_owner_ == operation_id) flush_owner_ = 0;
+    buffer_pool_.release_operation_pins(operation_id);
     // Explicit release makes result/error inspection possible without retaining operations forever.
     operations_.erase(operation_id);
     return StorageResult::SUCCESS;
