@@ -442,6 +442,11 @@ bool BufferPoolManager::select_clean_victim(frame_id_t& out_frame_id) noexcept {
             continue;
         }
 
+        if (active_flush_batch_.has_value() &&
+            completed_flush_pages_.find(descriptor.page_id) != completed_flush_pages_.end()) {
+            continue;
+        }
+
         if (descriptor.ref_bit) {
             descriptor.ref_bit = false;
             continue;
@@ -557,6 +562,11 @@ StorageResult BufferPoolManager::begin_page_load(page_id_t page_id,
     }
 
     const StorageResult result = assign_frame(page_id, BufferFrameState::LOADING, out_frame_id);
+    if (result == StorageResult::BUFFER_FULL) {
+        if (active_flush_batch_.has_value()) return StorageResult::BUSY;
+        const FlushBatch batch = get_active_flush_batch();
+        if (batch.batch_id != 0) return StorageResult::FLUSH_REQUIRED;
+    }
     if (result != StorageResult::SUCCESS) return result;
     FrameDescriptor& descriptor = frames_[out_frame_id].descriptor;
     descriptor.loading_id = next_load_id_++;
@@ -710,6 +720,119 @@ StorageResult BufferPoolManager::complete_page_flush(page_id_t page_id, flush_ba
     frame->descriptor.flushing_generation = 0;
     frame->descriptor.flushing_batch_id = 0;
 
+    return StorageResult::SUCCESS;
+}
+
+FlushBatch BufferPoolManager::get_active_flush_batch() {
+    if (active_flush_batch_.has_value()) return *active_flush_batch_;
+
+    FlushBatch batch;
+    batch.batch_id = next_flush_batch_id_++;
+    if (next_flush_batch_id_ == 0) next_flush_batch_id_ = 1;
+
+    try {
+        batch.pages.reserve(config_.max_flush_batch_pages);
+        for (const Frame& frame : frames_) {
+            const FrameDescriptor& descriptor = frame.descriptor;
+            if (descriptor.state != BufferFrameState::DIRTY || descriptor.pin_count != 0) continue;
+            if (batch.pages.size() == config_.max_flush_batch_pages) break;
+            FlushPage page;
+            page.page_id = descriptor.page_id;
+            page.generation = descriptor.dirty_generation;
+            page.bytes.assign(get_frame_bytes(descriptor.frame_id),
+                              get_frame_bytes(descriptor.frame_id) + DATABASE_PAGE_SIZE);
+            batch.pages.push_back(std::move(page));
+        }
+        if (batch.pages.empty()) return {};
+
+        completed_flush_pages_.clear();
+        completed_flush_pages_.reserve(batch.pages.size());
+        active_flush_batch_ = batch;
+        for (const FlushPage& page : batch.pages) {
+            Frame* frame = find_frame(page.page_id);
+            frame->descriptor.state = BufferFrameState::FLUSHING;
+            frame->descriptor.flushing_generation = page.generation;
+            frame->descriptor.flushing_batch_id = batch.batch_id;
+        }
+        return batch;
+    } catch (...) {
+        completed_flush_pages_.clear();
+        throw;
+    }
+}
+
+StorageResult BufferPoolManager::new_page(operation_id_t operation_id,
+                                           page_id_t expected_page_id,
+                                           PageHandle& out_handle) {
+    if (!is_valid_page_id(expected_page_id) || operation_id == 0) {
+        return StorageResult::INVALID_ARGUMENT;
+    }
+    frame_id_t frame_id = 0;
+    const StorageResult assign_result = assign_frame(expected_page_id, BufferFrameState::RESIDENT, frame_id);
+    if (assign_result == StorageResult::BUFFER_FULL) {
+        if (active_flush_batch_.has_value()) return StorageResult::BUSY;
+        const FlushBatch batch = get_active_flush_batch();
+        if (batch.batch_id != 0) return StorageResult::FLUSH_REQUIRED;
+    }
+    if (assign_result != StorageResult::SUCCESS) return assign_result;
+    std::fill_n(get_frame_bytes(frame_id), DATABASE_PAGE_SIZE, uint8_t{0});
+    frames_[frame_id].descriptor.state = BufferFrameState::DIRTY;
+    frames_[frame_id].descriptor.dirty_generation = 1;
+    const StorageResult pin_result = pin_page(expected_page_id, operation_id, AccessMode::READ_WRITE, out_handle);
+    if (pin_result != StorageResult::SUCCESS) {
+        frames_[frame_id].descriptor.state = BufferFrameState::RESIDENT;
+        release_page(expected_page_id);
+        return pin_result;
+    }
+    return StorageResult::SUCCESS;
+}
+
+StorageResult BufferPoolManager::finish_page_flush(flush_batch_id_t batch_id,
+                                                    page_id_t page_id,
+                                                    uint64_t generation,
+                                                    bool success) {
+    if (!active_flush_batch_.has_value() || active_flush_batch_->batch_id != batch_id) {
+        return StorageResult::INVALID_ARGUMENT;
+    }
+    const auto page_it = std::find_if(active_flush_batch_->pages.begin(), active_flush_batch_->pages.end(),
+                                      [page_id](const FlushPage& page) { return page.page_id == page_id; });
+    if (page_it == active_flush_batch_->pages.end() ||
+        completed_flush_pages_.find(page_id) != completed_flush_pages_.end()) {
+        return StorageResult::INVALID_ARGUMENT;
+    }
+    Frame* frame = find_frame(page_id);
+    if (frame == nullptr || frame->descriptor.state != BufferFrameState::FLUSHING ||
+        frame->descriptor.flushing_batch_id != batch_id ||
+        frame->descriptor.flushing_generation != generation) {
+        return StorageResult::INVALID_ARGUMENT;
+    }
+
+    if (!success) {
+        for (const FlushPage& page : active_flush_batch_->pages) {
+            Frame* failed_frame = find_frame(page.page_id);
+            if (failed_frame != nullptr &&
+                (failed_frame->descriptor.state == BufferFrameState::FLUSHING ||
+                 failed_frame->descriptor.state == BufferFrameState::RESIDENT) &&
+                (failed_frame->descriptor.flushing_batch_id == batch_id ||
+                 completed_flush_pages_.find(page.page_id) != completed_flush_pages_.end())) {
+                failed_frame->descriptor.state = BufferFrameState::DIRTY;
+                failed_frame->descriptor.flushing_generation = 0;
+                failed_frame->descriptor.flushing_batch_id = 0;
+            }
+        }
+        active_flush_batch_.reset();
+        completed_flush_pages_.clear();
+        return StorageResult::SUCCESS;
+    }
+
+    frame->descriptor.state = BufferFrameState::RESIDENT;
+    frame->descriptor.flushing_generation = 0;
+    frame->descriptor.flushing_batch_id = 0;
+    completed_flush_pages_.insert(page_id);
+    if (completed_flush_pages_.size() == active_flush_batch_->pages.size()) {
+        active_flush_batch_.reset();
+        completed_flush_pages_.clear();
+    }
     return StorageResult::SUCCESS;
 }
 

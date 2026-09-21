@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/types.hpp"
+#include "storage/buffer_pool_manager.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -85,13 +86,15 @@ class OperationScheduler {
         std::vector<Write> writes;
         size_t next_read_index{0};
         bool writes_applied{false};
-        std::unordered_map<page_id_t, std::vector<uint8_t>> resident_pages;
+        std::unordered_map<page_id_t, PageHandle> pinned_pages;
         std::optional<PageRequest> pending_page_request;
-        std::unordered_map<page_id_t, std::vector<uint8_t>> dirty_pages;
+        flush_batch_id_t active_flush_batch_id{0};
     };
 
     // The registry owns all operation memory. Erasing an entry is the scheduler's cleanup boundary.
+    BufferPoolManager buffer_pool_{BufferPoolConfig{64, 64, 64}};
     std::unordered_map<operation_id_t, Operation> operations_;
+    operation_id_t flush_owner_{0};
     // Zero is reserved as an invalid operation ID, so wraparound is treated as a creation failure.
     operation_id_t next_operation_id_{1};
 

@@ -37,7 +37,7 @@ export async function runOperation(
 
     if (status === SchedulerStatus.PageFault) {
       const pageIds = scheduler.getPendingPageIds(operationId);
-      if (pageIds.length !== 1) {
+      if (pageIds.length === 0) {
         scheduler.failOperation(operationId, "Scheduler returned an invalid page-fault request.");
         const error = scheduler.getExecutionError(operationId);
         scheduler.releaseOperation(operationId);
@@ -47,11 +47,27 @@ export async function runOperation(
       try {
         const pages = await store.readPages(pageIds);
         if (signal?.aborted) return cancelAndRelease(scheduler, operationId);
-        const pageId = pageIds[0]!;
-        const page = pages.get(pageId);
-        if (!page || page.byteLength !== DATABASE_PAGE_SIZE ||
-            scheduler.providePage(operationId, pageId, page.slice()) !== StorageResult.Success) {
-          scheduler.failOperation(operationId, "Host returned an invalid page response.");
+        const suppliedPages: Uint8Array[] = [];
+        for (const pageId of pageIds) {
+          const page = pages.get(pageId);
+          if (!page || page.byteLength !== DATABASE_PAGE_SIZE) {
+            scheduler.failOperation(operationId, "Host returned an invalid page response.");
+            suppliedPages.length = 0;
+            break;
+          }
+          suppliedPages.push(page);
+        }
+        if (suppliedPages.length === pageIds.length) {
+          for (let index = 0; index < pageIds.length; index += 1) {
+            const pageId = pageIds[index];
+            const page = suppliedPages[index];
+            if (pageId === undefined || page === undefined ||
+                scheduler.providePage(operationId, pageId, page.slice()) !==
+                StorageResult.Success) {
+              scheduler.failOperation(operationId, "Host returned an invalid page response.");
+              break;
+            }
+          }
         }
       } catch (error) {
         if (signal?.aborted) return cancelAndRelease(scheduler, operationId);

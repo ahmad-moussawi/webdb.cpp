@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
@@ -149,6 +150,17 @@ struct FrameDescriptor {
 
     // Unique identity of the current host page-load reservation.
     load_id_t loading_id{0};
+};
+
+struct FlushPage {
+    page_id_t page_id{INVALID_PAGE_ID};
+    uint64_t generation{0};
+    std::vector<uint8_t> bytes;
+};
+
+struct FlushBatch {
+    flush_batch_id_t batch_id{0};
+    std::vector<FlushPage> pages;
 };
 
 class BufferPoolManager {
@@ -301,6 +313,23 @@ public:
                                       uint64_t generation,
                                       bool success);
 
+    // Collects one bounded, immutable batch of unpinned dirty pages. Repeated
+    // calls return the same active batch until every page completes.
+    FlushBatch get_active_flush_batch();
+
+    // Allocates a caller-selected zeroed page without issuing a host read.
+    // New pages start DIRTY at generation one and are returned pinned.
+    StorageResult new_page(operation_id_t operation_id,
+                            page_id_t expected_page_id,
+                            PageHandle& out_handle);
+
+    // Completes one page in the active batch. A failed completion returns every
+    // page in that batch to DIRTY and clears the batch.
+    StorageResult finish_page_flush(flush_batch_id_t batch_id,
+                                    page_id_t page_id,
+                                    uint64_t generation,
+                                    bool success);
+
     // Releases an unpinned resident page mapping and returns its frame to the
     // ABSENT free list. Loading, dirty, or flushing pages cannot be discarded by
     // this Step 1 lifecycle method.
@@ -349,6 +378,8 @@ private:
     pin_token_t next_pin_token_{1};
     flush_batch_id_t next_flush_batch_id_{1};
     load_id_t next_load_id_{1};
+    std::optional<FlushBatch> active_flush_batch_;
+    std::unordered_set<page_id_t> completed_flush_pages_;
 
     // Operations waiting for a page whose frame is LOADING. The first miss
     // reserves the frame and adds its operation here; later misses join this

@@ -409,6 +409,93 @@ void test_buffer_pool_manager() {
                     StorageResult::SUCCESS,
                 "The active retry can still complete and preserve dirty state");
 
+    BufferPoolManager batch_pool(BufferPoolConfig{3, 3, 2});
+    frame_id_t batch_frame_a = 0;
+    frame_id_t batch_frame_b = 0;
+    TEST_ASSERT(batch_pool.load_page(FIRST_DATA_PAGE_ID, batch_frame_a) == StorageResult::SUCCESS &&
+                    batch_pool.load_page(FIRST_DATA_PAGE_ID + 1, batch_frame_b) == StorageResult::SUCCESS &&
+                    batch_pool.mark_page_dirty(FIRST_DATA_PAGE_ID) == StorageResult::SUCCESS &&
+                    batch_pool.mark_page_dirty(FIRST_DATA_PAGE_ID + 1) == StorageResult::SUCCESS,
+                "Two clean pages can become dirty for one flush batch");
+    FlushBatch active_batch = batch_pool.get_active_flush_batch();
+    TEST_ASSERT(active_batch.batch_id != 0 && active_batch.pages.size() == 2 &&
+                    batch_pool.flushing_count() == 2,
+                "Dirty pages are collected into one bounded active batch");
+    active_batch.pages.front().bytes[0] = 0xFF;
+    const FlushBatch stable_batch = batch_pool.get_active_flush_batch();
+    TEST_ASSERT(stable_batch.pages.front().bytes[0] != 0xFF,
+                "The active flush snapshot is isolated from caller mutation");
+    TEST_ASSERT(batch_pool.finish_page_flush(active_batch.batch_id, active_batch.pages.front().page_id,
+                                             active_batch.pages.front().generation + 1, true) ==
+                    StorageResult::INVALID_ARGUMENT &&
+                    batch_pool.flushing_count() == 2,
+                "A mismatched flush generation cannot complete a page");
+    TEST_ASSERT(batch_pool.finish_page_flush(active_batch.batch_id, active_batch.pages.front().page_id,
+                                             active_batch.pages.front().generation, true) == StorageResult::SUCCESS &&
+                    batch_pool.finish_page_flush(active_batch.batch_id, active_batch.pages.front().page_id,
+                                                 active_batch.pages.front().generation, true) ==
+                        StorageResult::INVALID_ARGUMENT,
+                "Duplicate flush completion is rejected");
+    frame_id_t batch_frame_c = 0;
+    TEST_ASSERT(batch_pool.load_page(FIRST_DATA_PAGE_ID + 2, batch_frame_c) == StorageResult::SUCCESS,
+                "A third page fills the batch pool");
+    PageHandle pin_c;
+    TEST_ASSERT(batch_pool.pin_page(FIRST_DATA_PAGE_ID + 2, 700, AccessMode::READ_ONLY, pin_c) == StorageResult::SUCCESS,
+                "The third page is pinned");
+    frame_id_t batch_frame_d = 0;
+    TEST_ASSERT(batch_pool.load_page(FIRST_DATA_PAGE_ID + 3, batch_frame_d) == StorageResult::BUFFER_FULL,
+                "Partially flushed pages in an active batch cannot be evicted");
+    pin_c.reset();
+    TEST_ASSERT(batch_pool.finish_page_flush(active_batch.batch_id, active_batch.pages.back().page_id,
+                                             active_batch.pages.back().generation, false) == StorageResult::SUCCESS &&
+                    batch_pool.flushing_count() == 0 && batch_pool.dirty_count() == 2,
+                "A failed batch returns every page to DIRTY and clears the active batch");
+
+    BufferPoolManager new_page_pool(BufferPoolConfig{1, 1, 1});
+    PageHandle new_page_handle;
+    TEST_ASSERT(new_page_pool.new_page(601, FIRST_DATA_PAGE_ID, new_page_handle) == StorageResult::SUCCESS &&
+                    new_page_handle.mutable_data()[0] == 0 &&
+                    new_page_pool.get_frame_descriptor(new_page_handle.frame_id())->state == BufferFrameState::DIRTY &&
+                    new_page_pool.get_frame_descriptor(new_page_handle.frame_id())->dirty_generation == 1,
+                "New pages are zeroed, dirty, and pinned for the creating operation");
+    new_page_handle.reset();
+    flush_batch_id_t new_page_batch_id = 0;
+    uint64_t new_page_generation = 0;
+    TEST_ASSERT(new_page_pool.begin_page_flush(FIRST_DATA_PAGE_ID, new_page_batch_id, new_page_generation) ==
+                    StorageResult::SUCCESS &&
+                    new_page_pool.complete_page_flush(FIRST_DATA_PAGE_ID, new_page_batch_id, new_page_generation,
+                                                       true) == StorageResult::SUCCESS,
+                "A new page can be flushed after its creating pin is released");
+
+    BufferPoolManager pressure_pool(BufferPoolConfig{1, 1, 1});
+    frame_id_t pressure_frame = 0;
+    TEST_ASSERT(pressure_pool.load_page(FIRST_DATA_PAGE_ID, pressure_frame) == StorageResult::SUCCESS &&
+                    pressure_pool.mark_page_dirty(FIRST_DATA_PAGE_ID) == StorageResult::SUCCESS,
+                "A one-frame pool can create dirty pressure");
+    PageHandle pressure_handle;
+    TEST_ASSERT(pressure_pool.pin_page(FIRST_DATA_PAGE_ID + 1, 602, AccessMode::READ_ONLY, pressure_handle) ==
+                    StorageResult::FLUSH_REQUIRED && pressure_pool.flushing_count() == 1,
+                "Dirty pressure requests a flush instead of evicting dirty data");
+    PageHandle np_handle;
+    TEST_ASSERT(pressure_pool.new_page(603, FIRST_DATA_PAGE_ID + 2, np_handle) == StorageResult::BUSY,
+                "new_page returns BUSY when a flush batch is already active");
+    const FlushBatch pressure_batch = pressure_pool.get_active_flush_batch();
+    TEST_ASSERT(pressure_batch.pages.size() == 1 &&
+                    pressure_pool.finish_page_flush(pressure_batch.batch_id, pressure_batch.pages.front().page_id,
+                                                    pressure_batch.pages.front().generation, true) ==
+                        StorageResult::SUCCESS,
+                "Dirty pressure can complete before the original pin is retried");
+    BufferPoolManager np_pressure_pool(BufferPoolConfig{1, 1, 1});
+    frame_id_t np_p_frame = 0;
+    TEST_ASSERT(np_pressure_pool.load_page(FIRST_DATA_PAGE_ID, np_p_frame) == StorageResult::SUCCESS &&
+                    np_pressure_pool.mark_page_dirty(FIRST_DATA_PAGE_ID) == StorageResult::SUCCESS,
+                "A second one-frame pool with dirty data creates dirty pressure");
+    PageHandle np_p_handle;
+    TEST_ASSERT(np_pressure_pool.new_page(604, FIRST_DATA_PAGE_ID + 1, np_p_handle) == StorageResult::FLUSH_REQUIRED &&
+                    np_pressure_pool.flushing_count() == 1,
+                "new_page returns FLUSH_REQUIRED when no evictable clean frames exist");
+
+
     TEST_ASSERT(pool.release_page(FIRST_DATA_PAGE_ID) == StorageResult::SUCCESS,
                 "A clean unpinned page can be released");
     TEST_ASSERT(!pool.find_frame_by_page_id(FIRST_DATA_PAGE_ID).has_value() &&
